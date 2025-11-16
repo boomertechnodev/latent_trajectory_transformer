@@ -51,6 +51,9 @@ checkpoints/
 *.jpg
 *.jpeg
 
+# Generated search indices
+*.index
+
 # Data
 data/
 logs/

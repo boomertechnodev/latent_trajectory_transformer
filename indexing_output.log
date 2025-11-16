@@ -1,0 +1,147 @@
+Creating new Raccoon model for codebase embedding...
+Creating new empty index...
+
+🔍 Indexing directory: .
+   Extensions: ['.py', '.md']
+   Excluding: ['.git', '__pycache__', 'node_modules', '.venv']
+
+   Indexing: latent_drift_trajectory.py... Warning: Faiss not installed. Using slow numpy search.
+(12 chunks)
+   Indexing: README.md... Warning: Faiss not installed. Using slow numpy search.
+(1 chunks)
+   Indexing: BIG_LONG_FEYNMAN_LECTURE.md... Warning: Faiss not installed. Using slow numpy search.
+(3 chunks)
+   Indexing: STABILITY_REPORT.md... Warning: Faiss not installed. Using slow numpy search.
+(3 chunks)
+   Indexing: baseline_benchmark.py... Warning: Faiss not installed. Using slow numpy search.
+(2 chunks)
+   Indexing: geometric_improvements.py... Warning: Faiss not installed. Using slow numpy search.
+(4 chunks)
+   Indexing: TEST_REPORT_ORIGINAL_ODE.md... Warning: Faiss not installed. Using slow numpy search.
+(5 chunks)
+   Indexing: enhanced_continual_learning.py... Warning: Faiss not installed. Using slow numpy search.
+(5 chunks)
+   Indexing: flow_integration_guide.py... Warning: Faiss not installed. Using slow numpy search.
+(3 chunks)
+   Indexing: ULTRATHINK_PLAN.md... Warning: Faiss not installed. Using slow numpy search.
+(6 chunks)
+   Indexing: BUG_REPORT.md... Warning: Faiss not installed. Using slow numpy search.
+(7 chunks)
+   Indexing: CLAUDE.md... Warning: Faiss not installed. Using slow numpy search.
+(6 chunks)
+   Indexing: latent_geometry_analysis.py... Warning: Faiss not installed. Using slow numpy search.
+(6 chunks)
+   Indexing: ORIGINAL_ODE_VALIDATION.md... Warning: Faiss not installed. Using slow numpy search.
+(4 chunks)
+   Indexing: CONTINUAL_LEARNING_REPORT.md... Warning: Faiss not installed. Using slow numpy search.
+(2 chunks)
+   Indexing: test_geometry.py... Warning: Faiss not installed. Using slow numpy search.
+(4 chunks)
+   Indexing: latent_drift_trajectory_stable.py... Warning: Faiss not installed. Using slow numpy search.
+(6 chunks)
+   Indexing: test_flow_improvements.py... Warning: Faiss not installed. Using slow numpy search.
+(3 chunks)
+   Indexing: test_stability.py... Warning: Faiss not installed. Using slow numpy search.
+(4 chunks)
+   Indexing: STATISTICAL_IMPROVEMENTS_REPORT.md... Warning: Faiss not installed. Using slow numpy search.
+(2 chunks)
+   Indexing: flow_mathematical_analysis.md... Warning: Faiss not installed. Using slow numpy search.
+(2 chunks)
+   Indexing: test_original_ode.py... Warning: Faiss not installed. Using slow numpy search.
+(3 chunks)
+   Indexing: integrate_raccoon_enhanced.py... Warning: Faiss not installed. Using slow numpy search.
+(4 chunks)
+   Indexing: test_continual_learning.py... Warning: Faiss not installed. Using slow numpy search.
+(4 chunks)
+   Indexing: improved_normalizing_flows.py... Warning: Faiss not installed. Using slow numpy search.
+(5 chunks)
+   Indexing: sequence_evaluation.py... Warning: Faiss not installed. Using slow numpy search.
+(4 chunks)
+   Indexing: raccoon_attention.py... Warning: Faiss not installed. Using slow numpy search.
+(3 chunks)
+   Indexing: FIXES_REFERENCE.py... Warning: Faiss not installed. Using slow numpy search.
+(4 chunks)
+   Indexing: codebase_search.py... Warning: Faiss not installed. Using slow numpy search.
+(4 chunks)
+   Indexing: TRANSFORMER_ANALYSIS_REPORT.md... Warning: Faiss not installed. Using slow numpy search.
+(2 chunks)
+   Indexing: benchmark_training.py... Warning: Faiss not installed. Using slow numpy search.
+(4 chunks)
+   Indexing: RACCOON_COMPARISON_GUIDE.md... Warning: Faiss not installed. Using slow numpy search.
+(4 chunks)
+   Indexing: transformer_improvements.py... Warning: Faiss not installed. Using slow numpy search.
+(6 chunks)
+   Indexing: ORIGINAL_ODE_MASTER_INDEX.md... Warning: Faiss not installed. Using slow numpy search.
+(2 chunks)
+   Indexing: test_statistical_measures.py... Warning: Faiss not installed. Using slow numpy search.
+(3 chunks)
+   Indexing: ALTERNATIVE_RACCOON_ANALYSIS.md... Warning: Faiss not installed. Using slow numpy search.
+(4 chunks)
+   Indexing: test_ultimate_raccoon.py... Warning: Faiss not installed. Using slow numpy search.
+(2 chunks)
+   Indexing: raccoon_alternative.py... Warning: Faiss not installed. Using slow numpy search.
+(6 chunks)
+   Indexing: transformer_modification_guide.md... Warning: Faiss not installed. Using slow numpy search.
+(3 chunks)
+   Indexing: ARCHITECTURAL_COMPARISON.md... Warning: Faiss not installed. Using slow numpy search.
+(4 chunks)
+   Indexing: transformer_integration_guide.py... Warning: Faiss not installed. Using slow numpy search.
+(4 chunks)
+   Indexing: improved_training.py... Warning: Faiss not installed. Using slow numpy search.
+(8 chunks)
+   Indexing: integration_guide.py... Warning: Faiss not installed. Using slow numpy search.
+(4 chunks)
+   Indexing: fractal_attention.py... Warning: Faiss not installed. Using slow numpy search.
+(7 chunks)
+   Indexing: IMPLEMENTATION_SUMMARY.md... Warning: Faiss not installed. Using slow numpy search.
+(4 chunks)
+   Indexing: sequence_modeling_improvements.py... Warning: Faiss not installed. Using slow numpy search.
+(7 chunks)
+   Indexing: .claude/agents/continual-learning.md... Warning: Faiss not installed. Using slow numpy search.
+(3 chunks)
+   Indexing: .claude/agents/transformer-architecture.md... Warning: Faiss not installed. Using slow numpy search.
+(4 chunks)
+   Indexing: .claude/agents/ode-sde-dynamics.md... Warning: Faiss not installed. Using slow numpy search.
+(2 chunks)
+   Indexing: .claude/agents/normalizing-flows.md... Warning: Faiss not installed. Using slow numpy search.
+(3 chunks)
+   Indexing: .claude/agents/fractal-attention-researcher.md... Warning: Faiss not installed. Using slow numpy search.
+(1 chunks)
+   Indexing: .claude/agents/numerical-stability.md... Warning: Faiss not installed. Using slow numpy search.
+(3 chunks)
+   Indexing: .claude/agents/research-experiments.md... Warning: Faiss not installed. Using slow numpy search.
+(3 chunks)
+   Indexing: .claude/agents/latent-geometry.md... Warning: Faiss not installed. Using slow numpy search.
+(3 chunks)
+   Indexing: .claude/agents/sequence-modeling.md... Warning: Faiss not installed. Using slow numpy search.
+(4 chunks)
+   Indexing: .claude/agents/training-optimization.md... Warning: Faiss not installed. Using slow numpy search.
+(3 chunks)
+   Indexing: .claude/agents/statistical-testing.md... Warning: Faiss not installed. Using slow numpy search.
+(3 chunks)
+   Indexing: .claude/skills/ode-sde-dynamics/SKILL.md... Warning: Faiss not installed. Using slow numpy search.
+(3 chunks)
+   Indexing: .claude/skills/training-optimization/SKILL.md... Warning: Faiss not installed. Using slow numpy search.
+(5 chunks)
+   Indexing: .claude/skills/latent-geometry/SKILL.md... Warning: Faiss not installed. Using slow numpy search.
+(5 chunks)
+   Indexing: .claude/skills/continual-learning/SKILL.md... Warning: Faiss not installed. Using slow numpy search.
+(4 chunks)
+   Indexing: .claude/skills/research-experiments/SKILL.md... Warning: Faiss not installed. Using slow numpy search.
+(6 chunks)
+   Indexing: .claude/skills/transformer-architecture/SKILL.md... Warning: Faiss not installed. Using slow numpy search.
+(5 chunks)
+   Indexing: .claude/skills/numerical-stability/SKILL.md... Warning: Faiss not installed. Using slow numpy search.
+(5 chunks)
+   Indexing: .claude/skills/statistical-testing/SKILL.md... Warning: Faiss not installed. Using slow numpy search.
+(6 chunks)
+   Indexing: .claude/skills/normalizing-flows/SKILL.md... Warning: Faiss not installed. Using slow numpy search.
+(4 chunks)
+   Indexing: .claude/skills/sequence-modeling/SKILL.md... Warning: Faiss not installed. Using slow numpy search.
+(6 chunks)
+
+✅ Indexed 67 files → 276 chunks
+
+Saving model to codebase_model.pt...
+Saving index to codebase.index...
+✅ Saved successfully

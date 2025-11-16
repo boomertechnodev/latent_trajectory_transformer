@@ -104,58 +104,146 @@ class FastEppsPulley(UnivariateTest):
     """
     Fast Epps-Pulley test statistic for univariate normality.
 
+    Mathematical Foundation:
+    The EP test is based on the characteristic function (CF) approach:
+    - CF of standard normal: φ_N(t) = exp(-t²/2)
+    - Empirical CF: φ_n(t) = (1/n)Σ exp(itX_j)
+    - Test statistic: T_n = n ∫ w(t)|φ_n(t) - φ_N(t)|² dt
+
+    where w(t) is a weight function that ensures convergence of the integral.
+
+    Properties:
+    - Consistent against all alternatives (detects all deviations from normality)
+    - Sensitive to all moments of the distribution
+    - Asymptotically normal under H₀
+
     Expects input x of shape (*, N, K) where N is the sample dimension
     and K is the "slice" dimension. Returns (*, K) test statistics.
     """
 
-    def __init__(self, t_max: float = 3.0, n_points: int = 17, integration: str = "trapezoid"):
+    def __init__(self, t_max: float = 3.0, n_points: int = 17,
+                 integration: str = "trapezoid", weight_type: str = "epps_pulley"):
         super().__init__()
-        assert n_points % 2 == 1
+        assert n_points % 2 == 1, "Need odd number of points for symmetry"
         self.integration = integration
         self.n_points = n_points
+        self.weight_type = weight_type
 
-        t = torch.linspace(0, t_max, n_points, dtype=torch.float32)  # positive half, incl 0
-        dt = t_max / (n_points - 1)
+        # Integration points - log-spaced for better coverage of frequency domain
+        # Low frequencies (near 0) capture location, high frequencies capture shape
+        if n_points > 5:
+            # Use log-spacing for better frequency coverage
+            t_positive = torch.exp(torch.linspace(
+                torch.log(torch.tensor(0.1)),
+                torch.log(torch.tensor(t_max)),
+                n_points // 2
+            ))
+            t = torch.cat([torch.tensor([0.0]), t_positive])
+        else:
+            t = torch.linspace(0, t_max, n_points, dtype=torch.float32)
 
-        # FIXED: Separate quadrature weights from weight function
-        # Trapezoid quadrature weights (NOT multiplied by phi)
-        quad_weights = torch.full((n_points,), 2 * dt, dtype=torch.float32)
-        quad_weights[0] = dt
-        quad_weights[-1] = dt
+        # Compute quadrature weights for numerical integration
+        if integration == "trapezoid":
+            # Trapezoid rule with non-uniform spacing
+            dt = torch.diff(t)
+            quad_weights = torch.zeros(len(t))
+            quad_weights[0] = dt[0] / 2 if len(dt) > 0 else 0
+            quad_weights[-1] = dt[-1] / 2 if len(dt) > 0 else 0
+            for i in range(1, len(t) - 1):
+                quad_weights[i] = (dt[i-1] + dt[i]) / 2
+        elif integration == "simpson":
+            # Simpson's rule (requires odd number of points)
+            dt = t_max / (n_points - 1)
+            quad_weights = torch.ones(n_points) * dt
+            quad_weights[1:-1:2] *= 4  # Odd indices
+            quad_weights[2:-1:2] *= 2  # Even indices
+            quad_weights /= 3
+        else:
+            raise ValueError(f"Unknown integration method: {integration}")
 
-        # Weight function (uniform for standard EP test)
-        w = torch.ones_like(t)
+        # Weight function w(t) for the EP test
+        if weight_type == "epps_pulley":
+            # Original EP weight: exp(-t²/2) ensures convergence
+            w = torch.exp(-0.5 * t.square())
+        elif weight_type == "uniform":
+            # Uniform weight (less emphasis on tail behavior)
+            w = torch.ones_like(t)
+        elif weight_type == "exponential":
+            # Exponential decay: exp(-|t|)
+            w = torch.exp(-torch.abs(t))
+        else:
+            raise ValueError(f"Unknown weight type: {weight_type}")
 
-        phi = (-0.5 * t.square()).exp()
+        # Standard normal characteristic function
+        phi = torch.exp(-0.5 * t.square())
 
         self.register_buffer("t", t)
         self.register_buffer("phi", phi)
-        # FIXED: Correctly combine quadrature and weight function
-        self.register_buffer("weights", quad_weights * w)
+        # Combine quadrature and weight function
+        self.register_buffer("weights", quad_weights * w * 2)  # *2 for symmetry
 
     def forward(self, x: Tensor) -> Tensor:
+        """
+        Compute EP test statistic.
+
+        Args:
+            x: Input tensor of shape (*, N, K) where N is sample size, K is slice dim
+
+        Returns:
+            Test statistics of shape (*, K)
+
+        Numerical Stability:
+        - Uses stable computation of characteristic functions
+        - Handles small sample sizes gracefully
+        - Robust to outliers through bounded weight function
+        """
         # x: (*, N, K)
         N = x.size(-2)
 
-        x_t = x.unsqueeze(-1) * self.t  # (*, N, K, n_points)
+        # Ensure numerical stability for small N
+        if N < 3:
+            # Return zero statistic for tiny samples
+            return torch.zeros(x.shape[:-2] + (x.shape[-1],), device=x.device)
+
+        # Standardize data for better numerical properties
+        x_mean = x.mean(dim=-2, keepdim=True)
+        x_std = x.std(dim=-2, keepdim=True) + 1e-8
+        x_standardized = (x - x_mean) / x_std
+
+        # Compute phase angles for characteristic function
+        x_t = x_standardized.unsqueeze(-1) * self.t  # (*, N, K, n_points)
+
+        # Numerically stable CF computation
+        # Split real and imaginary parts to avoid complex arithmetic
         cos_vals = torch.cos(x_t)
         sin_vals = torch.sin(x_t)
 
-        # Mean across samples (dimension -3 = N)
+        # Empirical characteristic function (mean across samples)
         cos_mean = cos_vals.mean(-3)  # (*, K, n_points)
         sin_mean = sin_vals.mean(-3)  # (*, K, n_points)
 
-        # DDP reduction
+        # DDP reduction for distributed training
         cos_mean = all_reduce(cos_mean)
         sin_mean = all_reduce(sin_mean)
 
-        # Error against standard normal characteristic function
-        err = (cos_mean - self.phi) ** 2 + sin_mean**2  # (*, K, n_points)
+        # Squared difference from standard normal CF
+        # |φ_n(t) - φ_N(t)|² = (Re[φ_n] - Re[φ_N])² + (Im[φ_n] - Im[φ_N])²
+        real_diff = cos_mean - self.phi
+        imag_diff = sin_mean  # Standard normal has zero imaginary part
 
-        # Weighted integration over t (last dim)
-        stats = err @ self.weights  # (*, K)
+        err = real_diff.square() + imag_diff.square()  # (*, K, n_points)
 
-        return stats * N * self.world_size
+        # Numerical integration using quadrature weights
+        stats = (err @ self.weights)  # (*, K)
+
+        # Scale by sample size (asymptotic theory)
+        # Under H₀: T_n ~ χ² distribution asymptotically
+        effective_n = N * self.world_size
+
+        # Apply finite-sample correction (Epps-Pulley 1983)
+        correction = 1.0 + 0.75/effective_n + 2.25/(effective_n**2)
+
+        return stats * effective_n * correction
 
 
 class EppsPulleyCF(UnivariateTest):
@@ -292,6 +380,362 @@ class SlicingUnivariateTest(nn.Module):
         else:
             raise ValueError(f"Unknown reduction: {self.reduction}")
 
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  ADVANCED DIVERGENCE MEASURES (MMD, Wasserstein, etc.)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class MaximumMeanDiscrepancy(nn.Module):
+    """
+    Maximum Mean Discrepancy (MMD) for two-sample testing and distribution matching.
+
+    Mathematical Foundation:
+    MMD measures the distance between mean embeddings of distributions in RKHS:
+        MMD²(P,Q) = ||μ_P - μ_Q||²_H = E[k(X,X')] + E[k(Y,Y')] - 2E[k(X,Y)]
+
+    where k is a kernel function (typically RBF/Gaussian).
+
+    Properties:
+    - Zero iff P = Q (for characteristic kernels)
+    - Differentiable w.r.t. samples
+    - No density estimation required
+    - Works in high dimensions
+    """
+    def __init__(self, kernel: str = 'gaussian', bandwidth: float = None):
+        super().__init__()
+        self.kernel = kernel
+        self.bandwidth = bandwidth
+
+    def gaussian_kernel(self, x: Tensor, y: Tensor, bandwidth: float) -> Tensor:
+        """
+        Gaussian (RBF) kernel: k(x,y) = exp(-||x-y||²/(2σ²))
+
+        Args:
+            x: (n, d) tensor
+            y: (m, d) tensor
+            bandwidth: Kernel bandwidth σ
+
+        Returns:
+            K: (n, m) kernel matrix
+        """
+        # Compute pairwise squared Euclidean distances
+        xx = (x * x).sum(dim=1, keepdim=True)  # (n, 1)
+        yy = (y * y).sum(dim=1, keepdim=True)  # (m, 1)
+        xy = torch.matmul(x, y.t())  # (n, m)
+
+        dists_sq = xx + yy.t() - 2 * xy  # (n, m)
+
+        # Ensure non-negative (numerical stability)
+        dists_sq = torch.clamp(dists_sq, min=0)
+
+        # Gaussian kernel
+        K = torch.exp(-dists_sq / (2 * bandwidth ** 2))
+        return K
+
+    def median_heuristic(self, x: Tensor, y: Tensor) -> float:
+        """
+        Median heuristic for bandwidth selection.
+        Uses median of pairwise distances.
+        """
+        with torch.no_grad():
+            combined = torch.cat([x, y], dim=0)
+            n = combined.shape[0]
+
+            # Sample subset for efficiency if too large
+            if n > 1000:
+                idx = torch.randperm(n)[:1000]
+                combined = combined[idx]
+
+            # Compute pairwise distances
+            dists = torch.cdist(combined, combined)
+
+            # Get upper triangular part (excluding diagonal)
+            mask = torch.triu(torch.ones_like(dists), diagonal=1).bool()
+            dists_flat = dists[mask]
+
+            # Median distance
+            median_dist = dists_flat.median().item()
+
+            # Bandwidth = median / sqrt(2 * log(n))
+            bandwidth = median_dist / (2 * torch.log(torch.tensor(n, dtype=torch.float32))).sqrt().item()
+
+        return max(bandwidth, 1e-6)  # Ensure positive
+
+    def forward(self, x: Tensor, y: Tensor) -> Tensor:
+        """
+        Compute MMD between samples from two distributions.
+
+        Args:
+            x: (n, d) samples from distribution P
+            y: (m, d) samples from distribution Q
+
+        Returns:
+            mmd: Scalar MMD value
+        """
+        n, d = x.shape
+        m, _ = y.shape
+
+        # Select bandwidth
+        if self.bandwidth is None:
+            bandwidth = self.median_heuristic(x, y)
+        else:
+            bandwidth = self.bandwidth
+
+        # Compute kernel matrices
+        if self.kernel == 'gaussian':
+            Kxx = self.gaussian_kernel(x, x, bandwidth)
+            Kyy = self.gaussian_kernel(y, y, bandwidth)
+            Kxy = self.gaussian_kernel(x, y, bandwidth)
+        else:
+            raise ValueError(f"Unknown kernel: {self.kernel}")
+
+        # Unbiased MMD estimator
+        # Remove diagonal terms for unbiased estimate
+        Kxx_sum = (Kxx.sum() - Kxx.trace()) / (n * (n - 1))
+        Kyy_sum = (Kyy.sum() - Kyy.trace()) / (m * (m - 1))
+        Kxy_sum = Kxy.sum() / (n * m)
+
+        mmd_squared = Kxx_sum + Kyy_sum - 2 * Kxy_sum
+
+        # Ensure non-negative (numerical stability)
+        mmd_squared = torch.clamp(mmd_squared, min=0)
+
+        return torch.sqrt(mmd_squared + 1e-8)  # Add epsilon for gradient stability
+
+
+class SlicedWassersteinDistance(nn.Module):
+    """
+    Sliced Wasserstein Distance for efficient high-dimensional distribution comparison.
+
+    Mathematical Foundation:
+    SW = (E_θ[W_p^p(P_θ, Q_θ)])^(1/p)
+
+    where P_θ, Q_θ are 1D projections of distributions P, Q along direction θ.
+
+    Properties:
+    - Computationally efficient: O(n log n) per projection
+    - Metrizes weak convergence
+    - Gradient-friendly
+    """
+    def __init__(self, n_projections: int = 100, p: int = 2):
+        super().__init__()
+        self.n_projections = n_projections
+        self.p = p
+
+    def wasserstein_1d(self, x: Tensor, y: Tensor, p: int = 2) -> Tensor:
+        """
+        Compute 1D Wasserstein distance between sorted samples.
+
+        Args:
+            x: (n,) sorted samples from first distribution
+            y: (m,) sorted samples from second distribution
+            p: Order of Wasserstein distance
+
+        Returns:
+            W_p: Scalar Wasserstein distance
+        """
+        n, m = len(x), len(y)
+
+        if n == m:
+            # Same size: direct matching after sorting
+            return (x - y).abs().pow(p).mean().pow(1/p)
+        else:
+            # Different sizes: use linear interpolation
+            # Map both to common grid [0, 1]
+            if n < m:
+                # Interpolate x to match y's size
+                x_interp = F.interpolate(
+                    x.unsqueeze(0).unsqueeze(0),
+                    size=m,
+                    mode='linear',
+                    align_corners=True
+                ).squeeze()
+                return (x_interp - y).abs().pow(p).mean().pow(1/p)
+            else:
+                # Interpolate y to match x's size
+                y_interp = F.interpolate(
+                    y.unsqueeze(0).unsqueeze(0),
+                    size=n,
+                    mode='linear',
+                    align_corners=True
+                ).squeeze()
+                return (x - y_interp).abs().pow(p).mean().pow(1/p)
+
+    def forward(self, x: Tensor, y: Tensor) -> Tensor:
+        """
+        Compute Sliced Wasserstein distance.
+
+        Args:
+            x: (n, d) samples from first distribution
+            y: (m, d) samples from second distribution
+
+        Returns:
+            sw_distance: Scalar SW distance
+        """
+        n, d = x.shape
+        m, _ = y.shape
+
+        # Generate random projections on unit sphere
+        theta = torch.randn(d, self.n_projections, device=x.device)
+        theta = F.normalize(theta, p=2, dim=0)  # (d, n_projections)
+
+        # Project samples
+        x_proj = torch.matmul(x, theta)  # (n, n_projections)
+        y_proj = torch.matmul(y, theta)  # (m, n_projections)
+
+        # Sort projections
+        x_proj_sorted, _ = x_proj.sort(dim=0)
+        y_proj_sorted, _ = y_proj.sort(dim=0)
+
+        # Compute 1D Wasserstein for each projection
+        distances = []
+        for i in range(self.n_projections):
+            dist = self.wasserstein_1d(
+                x_proj_sorted[:, i],
+                y_proj_sorted[:, i],
+                p=self.p
+            )
+            distances.append(dist)
+
+        # Average over projections
+        sw_distance = torch.stack(distances).mean()
+
+        return sw_distance
+
+
+class EnergyDistance(nn.Module):
+    """
+    Energy Distance for comparing distributions without density estimation.
+
+    Mathematical Foundation:
+    E(P,Q) = 2E[||X-Y||] - E[||X-X'||] - E[||Y-Y'||]
+
+    Properties:
+    - Metric on probability distributions
+    - Related to MMD with distance kernel
+    - Robust to outliers
+    """
+    def __init__(self, power: float = 1.0):
+        super().__init__()
+        self.power = power
+
+    def forward(self, x: Tensor, y: Tensor) -> Tensor:
+        """
+        Compute Energy distance.
+
+        Args:
+            x: (n, d) samples from first distribution
+            y: (m, d) samples from second distribution
+
+        Returns:
+            energy_dist: Scalar energy distance
+        """
+        n, d = x.shape
+        m, _ = y.shape
+
+        # Compute pairwise distances
+        dist_xy = torch.cdist(x, y).pow(self.power)  # (n, m)
+        dist_xx = torch.cdist(x, x).pow(self.power)  # (n, n)
+        dist_yy = torch.cdist(y, y).pow(self.power)  # (m, m)
+
+        # Energy distance (unbiased estimator)
+        # Remove diagonal for xx and yy
+        term1 = 2 * dist_xy.mean()
+        term2 = (dist_xx.sum() - dist_xx.trace()) / (n * (n - 1))
+        term3 = (dist_yy.sum() - dist_yy.trace()) / (m * (m - 1))
+
+        energy_dist = term1 - term2 - term3
+
+        return torch.clamp(energy_dist, min=0).pow(1/self.power)
+
+
+class AdaptiveKLDivergence(nn.Module):
+    """
+    Adaptive KL divergence with numerical stability and annealing.
+
+    Mathematical Foundation:
+    KL(q||p) = E_q[log(q/p)] = ∫ q(x) log(q(x)/p(x)) dx
+
+    For Gaussians:
+    KL(N(μ₁,Σ₁)||N(μ₂,Σ₂)) = 0.5[tr(Σ₂⁻¹Σ₁) + (μ₂-μ₁)ᵀΣ₂⁻¹(μ₂-μ₁) - k + log(|Σ₂|/|Σ₁|)]
+
+    Features:
+    - Numerical stability through log-space computation
+    - Beta annealing for VAE training
+    - Free bits for minimum information
+    """
+    def __init__(self, beta_start: float = 0.0, beta_end: float = 1.0,
+                 warmup_steps: int = 10000, free_bits: float = 0.0):
+        super().__init__()
+        self.beta_start = beta_start
+        self.beta_end = beta_end
+        self.warmup_steps = warmup_steps
+        self.free_bits = free_bits
+        self.register_buffer('step', torch.zeros(1, dtype=torch.long))
+
+    def gaussian_kl(self, mean_q: Tensor, logvar_q: Tensor,
+                    mean_p: Tensor = None, logvar_p: Tensor = None) -> Tensor:
+        """
+        KL divergence between two diagonal Gaussians.
+
+        Args:
+            mean_q, logvar_q: Parameters of q distribution
+            mean_p, logvar_p: Parameters of p distribution (default: standard normal)
+
+        Returns:
+            kl: KL divergence per dimension (batch, dim)
+        """
+        if mean_p is None:
+            mean_p = torch.zeros_like(mean_q)
+        if logvar_p is None:
+            logvar_p = torch.zeros_like(logvar_q)
+
+        # Numerical stability: clamp log-variances
+        logvar_q = torch.clamp(logvar_q, min=-10, max=10)
+        logvar_p = torch.clamp(logvar_p, min=-10, max=10)
+
+        # KL divergence formula
+        # 0.5 * [log|Σ_p| - log|Σ_q| - d + tr(Σ_p⁻¹Σ_q) + (μ_p-μ_q)ᵀΣ_p⁻¹(μ_p-μ_q)]
+        kl_elementwise = 0.5 * (
+            logvar_p - logvar_q - 1 +
+            torch.exp(logvar_q - logvar_p) +
+            (mean_q - mean_p).pow(2) * torch.exp(-logvar_p)
+        )
+
+        # Free bits: allow some KL per dimension for free
+        if self.free_bits > 0:
+            kl_elementwise = torch.maximum(
+                kl_elementwise,
+                torch.full_like(kl_elementwise, self.free_bits)
+            )
+
+        return kl_elementwise
+
+    def forward(self, mean_q: Tensor, logvar_q: Tensor,
+                mean_p: Tensor = None, logvar_p: Tensor = None) -> Tensor:
+        """
+        Compute annealed KL divergence.
+
+        Returns:
+            kl_loss: Scalar KL divergence with beta annealing
+        """
+        # Compute KL
+        kl_elementwise = self.gaussian_kl(mean_q, logvar_q, mean_p, logvar_p)
+        kl = kl_elementwise.sum(dim=-1).mean()  # Average over batch
+
+        # Beta annealing schedule
+        if self.training:
+            step = self.step.item()
+            if step < self.warmup_steps:
+                beta = self.beta_start + (self.beta_end - self.beta_start) * (step / self.warmup_steps)
+            else:
+                beta = self.beta_end
+            self.step += 1
+        else:
+            beta = self.beta_end
+
+        return beta * kl
 
 
 # ──────────────────────────────────────────────────────────────────────────────

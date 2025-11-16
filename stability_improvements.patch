@@ -1,0 +1,355 @@
+"""
+CRITICAL STABILITY IMPROVEMENTS FOR latent_drift_trajectory.py
+================================================================
+
+Apply these changes to prevent NaN/Inf losses and improve training stability.
+Each fix includes the line number and explanation.
+
+Author: Numerical Stability Specialist
+"""
+
+# ============================================================================
+# PATCH 1: Fix epsilon values for mixed precision compatibility
+# ============================================================================
+
+# Line 275: SlicingUnivariateTest - epsilon too small
+OLD (line 275):
+    A /= A.norm(p=2, dim=0) + 1e-12
+
+NEW:
+    # Use larger epsilon compatible with float16 (smallest normal = 6.1e-5)
+    eps = 1e-6 if x.dtype in [torch.float16, torch.bfloat16] else 1e-8
+    A /= A.norm(p=2, dim=0) + eps
+
+
+# Line 1495: KL divergence - epsilon too small
+OLD (line 1495):
+    (var_q + (mean - self.z0_mean).pow(2)) / (var_p + 1e-8) -
+
+NEW:
+    # Larger epsilon for numerical stability in division
+    eps = 1e-6 if mean.dtype in [torch.float16, torch.bfloat16] else 1e-8
+    (var_q + (mean - self.z0_mean).pow(2)) / (var_p + eps) -
+
+
+# Line 1244: Priority sampling - add epsilon
+OLD (line 1244):
+    probs = np.maximum(probs, 1e-10)
+
+NEW:
+    # More robust epsilon for probability normalization
+    probs = np.maximum(probs, 1e-6)
+
+
+# ============================================================================
+# PATCH 2: Add bounds to exponential operations
+# ============================================================================
+
+# Lines 340-345: PriorInitDistribution - bound log_s
+OLD (lines 340-345):
+class PriorInitDistribution(nn.Module):
+    def __init__(self, latent_size: int):
+        super().__init__()
+        self.m = nn.Parameter(torch.zeros(1, latent_size))
+        self.log_s = nn.Parameter(torch.zeros(1, latent_size))
+
+    def forward(self) -> D.Distribution:
+        m = self.m
+        s = torch.exp(self.log_s)
+        return D.Independent(D.Normal(m, s), 1)
+
+NEW:
+class PriorInitDistribution(nn.Module):
+    def __init__(self, latent_size: int):
+        super().__init__()
+        self.m = nn.Parameter(torch.zeros(1, latent_size))
+        self.log_s = nn.Parameter(torch.zeros(1, latent_size))
+
+    def forward(self) -> D.Distribution:
+        m = self.m
+        # Clamp log_s to prevent overflow/underflow
+        log_s_clamped = torch.clamp(self.log_s, min=-10, max=2)
+        s = torch.exp(log_s_clamped)
+        return D.Independent(D.Normal(m, s), 1)
+
+
+# Lines 1433-1435: Reparameterization trick - bound exponential
+OLD (lines 1433-1435):
+def sample_latent(self, mean: Tensor, logvar: Tensor) -> Tensor:
+    """Sample from latent distribution using reparameterization trick."""
+    std = torch.exp(0.5 * logvar)
+    eps = torch.randn_like(std)
+    return mean + eps * std
+
+NEW:
+def sample_latent(self, mean: Tensor, logvar: Tensor) -> Tensor:
+    """Sample from latent distribution using reparameterization trick."""
+    # Clamp logvar to prevent numerical issues
+    logvar = torch.clamp(logvar, min=-10, max=10)
+    std = torch.exp(0.5 * logvar)
+    eps = torch.randn_like(std)
+    return mean + eps * std
+
+
+# ============================================================================
+# PATCH 3: Replace -inf with bounded values in attention
+# ============================================================================
+
+# Line 610: QKVAttention - use bounded mask value
+OLD (line 610):
+    a = a.masked_fill(attzero, float("-inf"))
+
+NEW:
+    # Use large negative value instead of -inf for stability
+    # Works with all dtypes and prevents NaN in softmax
+    a = a.masked_fill(attzero, -1e9)
+
+
+# ============================================================================
+# PATCH 4: Add gradient clipping to training loops
+# ============================================================================
+
+# Lines 889-891: train_ode - add gradient clipping
+OLD (lines 889-891):
+    optim.zero_grad()
+    loss.backward()
+    optim.step()
+
+NEW:
+    optim.zero_grad()
+    loss.backward()
+    # Clip gradients to prevent explosion
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+    optim.step()
+
+
+# Lines 1618-1620: train_raccoon_classifier - add gradient clipping
+OLD (lines 1618-1620):
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+
+NEW:
+    optimizer.zero_grad()
+    loss.backward()
+    # Clip gradients for stability
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+    optimizer.step()
+
+
+# Lines 1579-1581: continuous_update - add gradient clipping
+OLD (lines 1579-1581):
+    self._adaptation_optimizer.zero_grad()
+    loss.backward()
+    self._adaptation_optimizer.step()
+
+NEW:
+    self._adaptation_optimizer.zero_grad()
+    loss.backward()
+    # Clip gradients for online learning stability
+    torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=0.5)
+    self._adaptation_optimizer.step()
+
+
+# ============================================================================
+# PATCH 5: Improve initialization for uninitialized layers
+# ============================================================================
+
+# Lines 633-636: TransformerBlock FFN layers
+OLD (lines 633-636):
+    self.ffn_fc1 = nn.Linear(dim_model, dim_hidden)
+    self.ffn_fc2 = nn.Linear(dim_hidden, dim_model)
+
+NEW:
+    self.ffn_fc1 = nn.Linear(dim_model, dim_hidden)
+    self.ffn_fc2 = nn.Linear(dim_hidden, dim_model)
+    # Add explicit initialization for stability
+    nn.init.xavier_uniform_(self.ffn_fc1.weight, gain=0.5)
+    nn.init.zeros_(self.ffn_fc1.bias)
+    nn.init.xavier_uniform_(self.ffn_fc2.weight, gain=0.1)  # Smaller for residual
+    nn.init.zeros_(self.ffn_fc2.bias)
+
+
+# Lines 657-660: Predictor network
+OLD (lines 657-660):
+    self.net = nn.Sequential(
+        nn.Linear(latent_size, hidden_size),
+        nn.SiLU(),
+        nn.Linear(hidden_size, latent_size),
+    )
+
+NEW:
+    self.net = nn.Sequential(
+        nn.Linear(latent_size, hidden_size),
+        nn.SiLU(),
+        nn.Linear(hidden_size, latent_size),
+    )
+    # Initialize predictor network properly
+    nn.init.xavier_uniform_(self.net[0].weight, gain=1.0)
+    nn.init.zeros_(self.net[0].bias)
+    nn.init.xavier_uniform_(self.net[2].weight, gain=0.1)  # Small for stability
+    nn.init.zeros_(self.net[2].bias)
+
+
+# Lines 1374-1383: RaccoonLogClassifier encoder
+ADD AFTER line 1383:
+    # Initialize encoder networks properly
+    for module in self.encoder:
+        if isinstance(module, nn.Linear):
+            nn.init.xavier_uniform_(module.weight, gain=0.5)
+            nn.init.zeros_(module.bias)
+
+    # Initialize mean/logvar projections with small values
+    nn.init.xavier_uniform_(self.enc_mean.weight, gain=0.1)
+    nn.init.zeros_(self.enc_mean.bias)
+    nn.init.xavier_uniform_(self.enc_logvar.weight, gain=0.01)  # Very small for logvar
+    nn.init.zeros_(self.enc_logvar.bias)
+
+
+# ============================================================================
+# PATCH 6: Add numerical stability checks
+# ============================================================================
+
+# Line 1063: solve_sde - add bounds check for sqrt
+OLD (line 1063):
+    dW = torch.randn_like(z) * torch.sqrt(dt)
+
+NEW:
+    # Ensure dt is positive for sqrt
+    dt_safe = torch.clamp(dt, min=1e-8)
+    dW = torch.randn_like(z) * torch.sqrt(dt_safe)
+
+
+# Line 605: QKVAttention - safe sqrt for scaling
+OLD (line 605):
+    a = torch.einsum("nhtd,nhsd->nhts", q, k) / math.sqrt(self.w_q.size(1))
+
+NEW:
+    # Add small epsilon to prevent division by zero
+    scale = 1.0 / math.sqrt(max(self.w_q.size(1), 1.0))
+    a = torch.einsum("nhtd,nhsd->nhts", q, k) * scale
+
+
+# ============================================================================
+# PATCH 7: Improve loss computation stability
+# ============================================================================
+
+# Lines 766-767: Add safe log_prob computation
+OLD (lines 766-767):
+    p_x = self.p_observe(torch.cat([z[:, :1, :], z_pred], dim=1), tokens)
+    recon_loss = -p_x.log_prob(tokens.reshape(-1)).mean()
+
+NEW:
+    p_x = self.p_observe(torch.cat([z[:, :1, :], z_pred], dim=1), tokens)
+    # Clamp log probabilities to prevent -inf
+    log_probs = p_x.log_prob(tokens.reshape(-1))
+    log_probs = torch.clamp(log_probs, min=-100, max=0)  # Reasonable bounds
+    recon_loss = -log_probs.mean()
+
+
+# Line 1486: Cross entropy with label smoothing for stability
+OLD (line 1486):
+    class_loss = F.cross_entropy(logits, labels)
+
+NEW:
+    # Add label smoothing for better generalization and stability
+    class_loss = F.cross_entropy(logits, labels, label_smoothing=0.1)
+
+
+# ============================================================================
+# PATCH 8: Add monitoring hooks for debugging
+# ============================================================================
+
+# Add after line 889 in train_ode:
+    # Monitor gradient norms for debugging
+    if step % 10 == 0:
+        total_norm = 0.0
+        for p in model.parameters():
+            if p.grad is not None:
+                param_norm = p.grad.data.norm(2)
+                total_norm += param_norm.item() ** 2
+        total_norm = total_norm ** 0.5
+
+        # Add to description
+        desc += f" grad_norm {total_norm:.3f}"
+
+        # Warn if gradients are exploding
+        if total_norm > 100:
+            print(f"⚠️ Warning: Large gradient norm {total_norm:.3f} at step {step}")
+
+
+# ============================================================================
+# PATCH 9: Stable attention implementation option
+# ============================================================================
+
+# Alternative stable softmax for line 612:
+OLD (line 612):
+    a = a.softmax(dim=3)
+
+NEW:
+    # Use stable softmax with max subtraction
+    a_max = a.max(dim=3, keepdim=True)[0]
+    a_exp = torch.exp(a - a_max)
+    a = a_exp / (a_exp.sum(dim=3, keepdim=True) + 1e-8)
+
+
+# ============================================================================
+# PATCH 10: Add checkpoint saving with numerical checks
+# ============================================================================
+
+# Add function for safe checkpoint saving:
+def save_checkpoint_with_validation(model, optimizer, epoch, path):
+    """Save checkpoint only if model is numerically stable."""
+
+    # Check for NaN/Inf in parameters
+    has_nan = False
+    has_inf = False
+
+    for name, param in model.named_parameters():
+        if torch.isnan(param).any():
+            print(f"⚠️ NaN detected in parameter: {name}")
+            has_nan = True
+        if torch.isinf(param).any():
+            print(f"⚠️ Inf detected in parameter: {name}")
+            has_inf = True
+
+    if not has_nan and not has_inf:
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+        }, path)
+        print(f"✅ Checkpoint saved: {path}")
+    else:
+        print(f"❌ Checkpoint NOT saved due to numerical issues")
+
+
+# ============================================================================
+# SUMMARY OF CRITICAL FIXES
+# ============================================================================
+
+"""
+Priority 1 (MUST FIX):
+- Replace 1e-12 with 1e-6 for float16 compatibility (lines 275, 1495, 1244)
+- Add gradient clipping to all training loops (lines 890, 1619, 1580)
+- Replace float("-inf") with -1e9 in attention (line 610)
+- Clamp log_s and logvar before exp() (lines 345, 1433)
+
+Priority 2 (SHOULD FIX):
+- Initialize all Linear layers properly (lines 633-636, 657-660, 1374-1383)
+- Add bounds checking for sqrt operations (lines 605, 1063)
+- Clamp log probabilities in loss computation (line 767)
+
+Priority 3 (NICE TO HAVE):
+- Add gradient norm monitoring (after line 889)
+- Use stable softmax implementation (line 612)
+- Add label smoothing for cross-entropy (line 1486)
+- Implement checkpoint validation before saving
+
+Testing Recommendations:
+1. Run with torch.autograd.detect_anomaly() enabled initially
+2. Monitor gradient norms throughout training
+3. Test with both float32 and float16/bfloat16
+4. Use gradient accumulation for large batch sizes
+5. Start with smaller learning rates (5e-4 instead of 1e-3)
+"""

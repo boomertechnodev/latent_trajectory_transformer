@@ -359,8 +359,8 @@ class PriorODE(ODE):
         # FIXED: Use depth=5 instead of 11 for better gradient flow
         for i in range(depth):
             linear = nn.Linear(input_dim, hidden_size)
-            # FIXED: Smaller initialization gain for deep networks
-            nn.init.xavier_uniform_(linear.weight, gain=0.1)
+            # IMPROVED: Better initialization gain for gradient flow (from numerical-stability agent)
+            nn.init.xavier_uniform_(linear.weight, gain=1.0)
             nn.init.zeros_(linear.bias)
             layers.append(linear)
             layers.append(nn.LayerNorm(hidden_size))
@@ -888,6 +888,8 @@ def train_ode(
 
         optim.zero_grad()
         loss.backward()
+        # IMPROVED: Gradient clipping for stability (from numerical-stability + training-optimization agents)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optim.step()
 
         desc = (
@@ -997,11 +999,11 @@ class RaccoonDynamics(nn.Module):
             nn.Linear(hidden_dim, latent_dim)
         )
 
-        # Initialize small to start near identity
+        # IMPROVED: Better initialization for gradient flow (from numerical-stability agent)
         for module in [self.drift_net, self.log_diffusion_net]:
             for layer in module:
                 if isinstance(layer, nn.Linear):
-                    nn.init.xavier_normal_(layer.weight, gain=0.1)
+                    nn.init.xavier_normal_(layer.weight, gain=1.0)
                     nn.init.zeros_(layer.bias)
 
     def forward(self, z: Tensor, t: Tensor) -> tuple[Tensor, Tensor]:
@@ -1384,8 +1386,8 @@ class RaccoonLogClassifier(nn.Module):
         # SDE dynamics (using new sigma_min/sigma_max parameters)
         self.dynamics = RaccoonDynamics(latent_dim, hidden_dim, sigma_min=1e-4, sigma_max=1.0)
 
-        # Normalizing flows
-        self.flow = RaccoonFlow(latent_dim, hidden_dim, num_layers=4)
+        # IMPROVED: More flow layers for better expressiveness (from normalizing-flows agent)
+        self.flow = RaccoonFlow(latent_dim, hidden_dim, num_layers=8)
 
         # Classifier head: latent → class logits
         self.classifier = nn.Sequential(
@@ -1534,10 +1536,11 @@ class RaccoonLogClassifier(nn.Module):
             z = self.sample_latent(mean, logvar)
             logits = self.classify(z)
 
-            # Quality score = classification confidence
+            # IMPROVED: Use uncertainty (entropy) instead of confidence (from continual-learning agent)
+            # Higher entropy = more uncertain = more valuable for learning
             probs = F.softmax(logits, dim=1)
-            confidence = probs.max(dim=1).values
-            score = confidence.mean().item()
+            entropy = -(probs * torch.log(probs + 1e-10)).sum(dim=1)
+            score = entropy.mean().item()
 
         # FIXED: Store as dict instead of concatenating tensors
         # Add to memory (store each sample separately with proper structure)
@@ -1617,6 +1620,8 @@ def train_raccoon_classifier(
         # Backward pass
         optimizer.zero_grad()
         loss.backward()
+        # IMPROVED: Gradient clipping for stability (from numerical-stability + training-optimization agents)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
 
         # Logging

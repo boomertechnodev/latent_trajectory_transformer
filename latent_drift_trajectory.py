@@ -782,6 +782,13 @@ class DeterministicLatentODE(nn.Module):
             + w_ode * ode_reg_loss
         )
 
+        # DEFENSIVE: Check for NaN/Inf in loss before returning
+        if torch.isnan(loss) or torch.isinf(loss):
+            print(f"⚠️  NaN/Inf detected in ODE model loss!")
+            print(f"  recon: {recon_loss.item()}, latent_ep: {latent_reg.item()}, ode_reg: {ode_reg_loss.item()}")
+            # Return a safe fallback loss
+            loss = torch.tensor(1e6, device=loss.device, requires_grad=True)
+
         stats = {
             "recon": recon_loss.detach(),
             "latent_ep": latent_reg.detach(),
@@ -888,6 +895,21 @@ def train_ode(
 
         optim.zero_grad()
         loss.backward()
+
+        # DEFENSIVE: Check for NaN/Inf in gradients before clipping
+        has_nan = False
+        max_grad_norm = 0.0
+        for name, param in model.named_parameters():
+            if param.grad is not None:
+                if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                    print(f"\n⚠️  NaN/Inf detected in gradient of {name}")
+                    has_nan = True
+                max_grad_norm = max(max_grad_norm, param.grad.norm().item())
+
+        if has_nan:
+            print(f"⚠️  Skipping update due to NaN/Inf gradients at step {step}")
+            continue
+
         # IMPROVED: Gradient clipping for stability (from numerical-stability + training-optimization agents)
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optim.step()
@@ -1213,22 +1235,22 @@ class RaccoonMemory:
             self.buffer.pop(worst_idx)
             self.scores.pop(worst_idx)
 
-    def sample(self, n: int, device: torch.device) -> list:
+    def sample(self, batch_size: int) -> list:
         """
         Sample experiences with bias toward higher quality.
 
         Args:
-            n: Number of samples
-            device: Device to load tensors to
+            batch_size: Number of samples to draw
         Returns:
-            List of sampled trajectories
+            List of sampled trajectories (as dicts with 'tokens' and 'label' keys)
+            Tensors are on CPU - caller should move to desired device.
         """
         if len(self.buffer) == 0:
             raise RuntimeError("Cannot sample from empty memory buffer")
 
         # FIXED: Determine if we need replacement
         available = len(self.buffer)
-        replacement = available < n
+        replacement = available < batch_size
 
         # FIXED: Robust score normalization using softmax trick
         import numpy as np
@@ -1247,7 +1269,7 @@ class RaccoonMemory:
         probs = probs / probs.sum()
 
         probs_tensor = torch.from_numpy(probs).float()
-        indices = torch.multinomial(probs_tensor, n, replacement=replacement)
+        indices = torch.multinomial(probs_tensor, batch_size, replacement=replacement)
 
         # Return sampled items (handle dict format from fixed continuous_update)
         return [self.buffer[i] for i in indices]
@@ -1386,8 +1408,9 @@ class RaccoonLogClassifier(nn.Module):
         # SDE dynamics (using new sigma_min/sigma_max parameters)
         self.dynamics = RaccoonDynamics(latent_dim, hidden_dim, sigma_min=1e-4, sigma_max=1.0)
 
-        # IMPROVED: More flow layers for better expressiveness (from normalizing-flows agent)
-        self.flow = RaccoonFlow(latent_dim, hidden_dim, num_layers=8)
+        # Normalizing flow: 4 coupling layers balances expressiveness with numerical stability
+        # (More layers increases log-det accumulation and gradient flow complexity)
+        self.flow = RaccoonFlow(latent_dim, hidden_dim, num_layers=4)
 
         # Classifier head: latent → class logits
         self.classifier = nn.Sequential(
@@ -1508,6 +1531,13 @@ class RaccoonLogClassifier(nn.Module):
         w_class, w_kl, w_ep = loss_weights
         loss = w_class * class_loss + w_kl * kl_loss + w_ep * ep_loss
 
+        # DEFENSIVE: Check for NaN/Inf in loss before returning
+        if torch.isnan(loss) or torch.isinf(loss):
+            print(f"⚠️  NaN/Inf detected in total loss!")
+            print(f"  class_loss: {class_loss.item()}, kl_loss: {kl_loss.item()}, ep_loss: {ep_loss.item()}")
+            # Return a safe fallback loss
+            loss = torch.tensor(1e6, device=loss.device, requires_grad=True)
+
         # Accuracy
         with torch.no_grad():
             preds = logits.argmax(dim=1)
@@ -1518,6 +1548,7 @@ class RaccoonLogClassifier(nn.Module):
             "kl_loss": kl_loss.detach(),
             "ep_loss": ep_loss.detach(),
             "accuracy": acc.detach(),
+            "logits": logits.detach(),
         }
 
         return loss, stats
@@ -1553,8 +1584,8 @@ class RaccoonLogClassifier(nn.Module):
 
         # Perform update if enough memory
         if len(self.memory) >= 32:
-            # Sample from memory
-            memory_batch = self.memory.sample(16, device=tokens.device)
+            # Sample from memory (returns CPU tensors)
+            memory_batch = self.memory.sample(batch_size=16)
 
             if len(memory_batch) > 0:
                 # FIXED: Properly extract and concatenate from dict structure
@@ -1563,7 +1594,8 @@ class RaccoonLogClassifier(nn.Module):
                 memory_labels_list = [m['label'].to(device) for m in memory_batch]
 
                 memory_tokens = torch.cat(memory_tokens_list, dim=0)  # (16, seq_len)
-                memory_labels = torch.cat(memory_labels_list, dim=0).squeeze()  # (16,)
+                # FIXED: Use flatten() instead of squeeze() for consistent 1-d shape
+                memory_labels = torch.cat(memory_labels_list, dim=0).flatten()  # (16,)
 
                 # Combine with new data - shapes now match!
                 all_tokens = torch.cat([tokens, memory_tokens], dim=0)
@@ -1620,6 +1652,21 @@ def train_raccoon_classifier(
         # Backward pass
         optimizer.zero_grad()
         loss.backward()
+
+        # DEFENSIVE: Check for NaN/Inf in gradients before clipping
+        has_nan = False
+        max_grad_norm = 0.0
+        for name, param in model.named_parameters():
+            if param.grad is not None:
+                if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                    print(f"\n⚠️  NaN/Inf detected in gradient of {name}")
+                    has_nan = True
+                max_grad_norm = max(max_grad_norm, param.grad.norm().item())
+
+        if has_nan:
+            print(f"⚠️  Skipping update due to NaN/Inf gradients at step {step}")
+            continue
+
         # IMPROVED: Gradient clipping for stability (from numerical-stability + training-optimization agents)
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()

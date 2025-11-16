@@ -117,15 +117,21 @@ class FastEppsPulley(UnivariateTest):
         t = torch.linspace(0, t_max, n_points, dtype=torch.float32)  # positive half, incl 0
         dt = t_max / (n_points - 1)
 
-        weights = torch.full((n_points,), 2 * dt, dtype=torch.float32)
-        weights[0] = dt
-        weights[-1] = dt
+        # FIXED: Separate quadrature weights from weight function
+        # Trapezoid quadrature weights (NOT multiplied by phi)
+        quad_weights = torch.full((n_points,), 2 * dt, dtype=torch.float32)
+        quad_weights[0] = dt
+        quad_weights[-1] = dt
+
+        # Weight function (uniform for standard EP test)
+        w = torch.ones_like(t)
 
         phi = (-0.5 * t.square()).exp()
 
         self.register_buffer("t", t)
         self.register_buffer("phi", phi)
-        self.register_buffer("weights", weights * self.phi)
+        # FIXED: Correctly combine quadrature and weight function
+        self.register_buffer("weights", quad_weights * w)
 
     def forward(self, x: Tensor) -> Tensor:
         # x: (*, N, K)
@@ -341,21 +347,31 @@ class PriorInitDistribution(nn.Module):
 
 
 class PriorODE(ODE):
-    def __init__(self, latent_size: int, hidden_size: int):
+    """
+    IMPROVED: Shallower network (5 layers instead of 11) with better initialization
+    for improved gradient flow and numerical stability.
+    """
+    def __init__(self, latent_size: int, hidden_size: int, depth: int = 5):
         super().__init__()
 
         layers = []
         input_dim = latent_size + 1
-        for i in range(11):
+        # FIXED: Use depth=5 instead of 11 for better gradient flow
+        for i in range(depth):
             linear = nn.Linear(input_dim, hidden_size)
-            nn.init.xavier_uniform_(linear.weight)
+            # FIXED: Smaller initialization gain for deep networks
+            nn.init.xavier_uniform_(linear.weight, gain=0.1)
             nn.init.zeros_(linear.bias)
             layers.append(linear)
             layers.append(nn.LayerNorm(hidden_size))
             layers.append(nn.SiLU())
             input_dim = hidden_size
+
+        # FIXED: Add normalization before final layer
+        layers.append(nn.LayerNorm(hidden_size))
         final_linear = nn.Linear(hidden_size, latent_size)
-        nn.init.xavier_uniform_(final_linear.weight)
+        # FIXED: Use orthogonal init for output layer
+        nn.init.orthogonal_(final_linear.weight)
         nn.init.zeros_(final_linear.bias)
         layers.append(final_linear)
         self.drift_net = nn.Sequential(*layers)
@@ -744,7 +760,7 @@ class DeterministicLatentODE(nn.Module):
         ode_reg_loss, z_pred = self.ode_matching_loss(z)
 
         z_for_test = z_pred.reshape(1, -1, latent_size)  # (1, N, D)
-        latent_stat = self.latent_test(z_pred)
+        latent_stat = self.latent_test(z_for_test)  # FIXED: Use reshaped tensor
         latent_reg = latent_stat.mean() + latent_reg
 
         p_x = self.p_observe(torch.cat([z[:, :1, :], z_pred], dim=1), tokens)
@@ -909,45 +925,916 @@ def train_ode(
 # ──────────────────────────────────────────────────────────────────────────────
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+#  RACCOON-IN-A-BUNGEECORD IMPLEMENTATION
+#  Stochastic SDE-based continuous learning architecture
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TimeAwareTransform(nn.Module):
+    """
+    Multi-scale time embedding using exponentially-spaced frequency bands.
+    Provides richer temporal representation than simple sinusoidal encoding.
+    """
+    def __init__(self, time_dim: int = 32):
+        super().__init__()
+        self.time_dim = time_dim
+
+        # Frequency bands from 1 Hz to 1000 Hz (multi-scale temporal resolution)
+        freqs = torch.exp(torch.linspace(
+            math.log(1.0),
+            math.log(1000.0),
+            time_dim // 2
+        ))
+        self.register_buffer('freqs', freqs)
+
+    def embed_time(self, t: Tensor) -> Tensor:
+        """
+        Convert scalar time to rich multi-frequency features.
+
+        Args:
+            t: Time tensor (batch, 1)
+        Returns:
+            time_embed: (batch, time_dim) with sin/cos features
+        """
+        # t shape: (batch, 1)
+        angles = t * self.freqs[None, :]  # (batch, time_dim//2)
+
+        # Stack sin and cos for rotation-invariant representation
+        time_embed = torch.cat([
+            torch.sin(angles),
+            torch.cos(angles)
+        ], dim=-1)  # (batch, time_dim)
+
+        return time_embed
+
+
+class RaccoonDynamics(nn.Module):
+    """
+    SDE dynamics with separate drift and diffusion networks.
+
+    Implements: dz = drift(z,t)*dt + diffusion(z,t)*dW
+    where dW is Wiener process (Brownian motion)
+    """
+    def __init__(self, latent_dim: int, hidden_dim: int,
+                 sigma_min: float = 1e-4, sigma_max: float = 1.0):
+        super().__init__()
+        self.sigma_min = sigma_min
+        self.sigma_max = sigma_max
+
+        # Drift network (deterministic component)
+        self.drift_net = nn.Sequential(
+            nn.Linear(latent_dim + 1, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, latent_dim)
+        )
+
+        # FIXED: Diffusion network outputs log-variance for better numerical stability
+        self.log_diffusion_net = nn.Sequential(
+            nn.Linear(latent_dim + 1, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, latent_dim)
+        )
+
+        # Initialize small to start near identity
+        for module in [self.drift_net, self.log_diffusion_net]:
+            for layer in module:
+                if isinstance(layer, nn.Linear):
+                    nn.init.xavier_normal_(layer.weight, gain=0.1)
+                    nn.init.zeros_(layer.bias)
+
+    def forward(self, z: Tensor, t: Tensor) -> tuple[Tensor, Tensor]:
+        """
+        Compute drift and diffusion at current state and time.
+
+        Args:
+            z: Current latent state (batch, latent_dim)
+            t: Current time (batch, 1)
+        Returns:
+            drift: Deterministic velocity (batch, latent_dim)
+            diffusion: Stochastic scale (batch, latent_dim)
+        """
+        zt = torch.cat([z, t], dim=-1)
+
+        drift = self.drift_net(zt)
+
+        # FIXED: Compute diffusion with proper bounds for numerical stability
+        log_diffusion = self.log_diffusion_net(zt)
+        # Clip log-diffusion to ensure numerical stability
+        log_diffusion = torch.clamp(log_diffusion,
+                                     math.log(self.sigma_min),
+                                     math.log(self.sigma_max))
+        diffusion = torch.exp(log_diffusion)
+
+        return drift, diffusion
+
+
+def solve_sde(
+    dynamics: RaccoonDynamics,
+    z0: Tensor,
+    t_span: Tensor,
+) -> Tensor:
+    """
+    Solve SDE using Euler-Maruyama method.
+
+    Args:
+        dynamics: RaccoonDynamics instance
+        z0: Initial state (batch, latent_dim)
+        t_span: Time points (num_steps,)
+    Returns:
+        path: Trajectory (batch, num_steps, latent_dim)
+    """
+    device = z0.device
+    batch_size = z0.shape[0]
+
+    path = [z0]
+    z = z0
+
+    for i in range(len(t_span) - 1):
+        dt = t_span[i+1] - t_span[i]
+        # FIXED: Correct tensor broadcasting from 0-d scalar
+        t_curr = t_span[i:i+1].expand(batch_size, 1)
+
+        # Get drift and diffusion
+        drift, diffusion = dynamics(z, t_curr)
+
+        # Euler-Maruyama step
+        dW = torch.randn_like(z) * torch.sqrt(dt)
+        z = z + drift * dt + diffusion * dW
+
+        path.append(z)
+
+    return torch.stack(path, dim=1)  # (batch, num_steps, latent)
+
+
+class CouplingLayer(nn.Module):
+    """
+    Affine coupling layer for normalizing flows.
+    Splits dimensions, uses one half to transform the other.
+
+    IMPROVED: Parameterized time_dim and scale_range for better flexibility.
+    """
+    def __init__(self, dim: int, hidden: int, mask: Tensor,
+                 time_dim: int = 32, scale_range: float = 3.0):
+        super().__init__()
+        self.register_buffer('mask', mask)
+        self.time_dim = time_dim
+        self.scale_range = scale_range
+
+        # FIXED: Network with parameterized time_dim (not hardcoded 32)
+        self.transform_net = nn.Sequential(
+            nn.Linear(dim + time_dim, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, dim * 2)  # Output scale and shift
+        )
+
+    def forward(self, x: Tensor, time_feat: Tensor,
+                reverse: bool = False) -> tuple[Tensor, Tensor]:
+        """
+        Apply coupling transformation.
+
+        Args:
+            x: Input (batch, dim)
+            time_feat: Time features (batch, 32)
+            reverse: If True, apply inverse transform
+        Returns:
+            y: Transformed output (batch, dim)
+            log_det: Log determinant of Jacobian (batch,)
+        """
+        # Split using mask
+        x_masked = x * self.mask
+
+        # Compute transformation parameters conditioned on masked input and time
+        h = torch.cat([x_masked, time_feat], dim=-1)
+        params = self.transform_net(h)
+        scale, shift = params.chunk(2, dim=-1)
+
+        # FIXED: Configurable scale bounds for more expressiveness
+        scale = torch.tanh(scale / self.scale_range) * self.scale_range
+
+        # Apply transformation only to non-masked dimensions
+        if not reverse:
+            y = x_masked + (1 - self.mask) * (x * torch.exp(scale) + shift)
+            log_det = (scale * (1 - self.mask)).sum(dim=-1)
+        else:
+            y = x_masked + (1 - self.mask) * ((x - shift) * torch.exp(-scale))
+            log_det = (-scale * (1 - self.mask)).sum(dim=-1)
+
+        return y, log_det
+
+
+class RaccoonFlow(nn.Module):
+    """
+    Normalizing flow with multiple coupling layers.
+    Provides invertible transformation for latent variables.
+
+    IMPROVED: Parameterized time_dim throughout for consistency.
+    """
+    def __init__(self, latent_dim: int, hidden_dim: int, num_layers: int = 4, time_dim: int = 32):
+        super().__init__()
+        self.time_embed = TimeAwareTransform(time_dim=time_dim)
+
+        # Build coupling layers with alternating masks
+        self.flows = nn.ModuleList()
+        for i in range(num_layers):
+            # Alternate which dimensions we transform
+            mask = self._make_mask(latent_dim, i % 2)
+            # FIXED: Pass time_dim to CouplingLayer
+            self.flows.append(
+                CouplingLayer(latent_dim, hidden_dim, mask, time_dim=time_dim)
+            )
+
+    def _make_mask(self, dim: int, parity: int) -> Tensor:
+        """Create alternating mask for coupling layers."""
+        mask = torch.zeros(dim)
+        mask[parity::2] = 1  # Every other dimension
+        return mask
+
+    def forward(self, z: Tensor, t: Tensor,
+                reverse: bool = False) -> tuple[Tensor, Tensor]:
+        """
+        Apply flow transformation.
+
+        Args:
+            z: Input latent (batch, latent_dim)
+            t: Time (batch, 1)
+            reverse: If True, apply inverse flow (generation)
+        Returns:
+            z_out: Transformed latent (batch, latent_dim)
+            log_det_sum: Total log determinant (batch,)
+        """
+        time_features = self.time_embed.embed_time(t)
+        log_det_sum = torch.zeros(z.shape[0], device=z.device)
+
+        # Apply flows in order (or reverse)
+        flows = reversed(self.flows) if reverse else self.flows
+
+        for flow in flows:
+            z, log_det = flow(z, time_features, reverse=reverse)
+            log_det_sum += log_det
+
+        return z, log_det_sum
+
+
+class RaccoonMemory:
+    """
+    Experience replay buffer with priority sampling.
+    Stores trajectories and quality scores for continuous learning.
+    """
+    def __init__(self, max_size: int = 10000):
+        self.max_size = max_size
+        self.buffer = []
+        self.scores = []
+
+    def add(self, trajectory, score: float):
+        """
+        Add experience to memory with quality score.
+        If full, remove worst experience.
+        """
+        # Handle both tensor and dict inputs
+        if isinstance(trajectory, dict):
+            # Already in dict format (from fixed continuous_update)
+            self.buffer.append(trajectory)
+        else:
+            # Old format - convert to CPU
+            self.buffer.append(trajectory.detach().cpu())
+        self.scores.append(score)
+
+        # FIXED: Use numpy for efficiency instead of creating tensor each time
+        if len(self.buffer) > self.max_size:
+            import numpy as np
+            scores_array = np.array(self.scores)
+            worst_idx = int(scores_array.argmin())
+            self.buffer.pop(worst_idx)
+            self.scores.pop(worst_idx)
+
+    def sample(self, n: int, device: torch.device) -> list:
+        """
+        Sample experiences with bias toward higher quality.
+
+        Args:
+            n: Number of samples
+            device: Device to load tensors to
+        Returns:
+            List of sampled trajectories
+        """
+        if len(self.buffer) == 0:
+            raise RuntimeError("Cannot sample from empty memory buffer")
+
+        # FIXED: Determine if we need replacement
+        available = len(self.buffer)
+        replacement = available < n
+
+        # FIXED: Robust score normalization using softmax trick
+        import numpy as np
+        scores_array = np.array(self.scores)
+
+        # Subtract max for numerical stability (standard softmax trick)
+        scores_shifted = scores_array - scores_array.max()
+
+        # Use softmax with temperature
+        temperature = 1.0
+        exp_scores = np.exp(scores_shifted / temperature)
+        probs = exp_scores / exp_scores.sum()
+
+        # Ensure valid probabilities
+        probs = np.maximum(probs, 1e-10)
+        probs = probs / probs.sum()
+
+        probs_tensor = torch.from_numpy(probs).float()
+        indices = torch.multinomial(probs_tensor, n, replacement=replacement)
+
+        # Return sampled items (handle dict format from fixed continuous_update)
+        return [self.buffer[i] for i in indices]
+
+    def __len__(self):
+        return len(self.buffer)
+
+    def state_dict(self) -> dict:
+        """ADDED: Export memory state for checkpointing."""
+        return {
+            'buffer': self.buffer,  # Already on CPU from add()
+            'scores': self.scores,
+            'max_size': self.max_size,
+        }
+
+    def load_state_dict(self, state: dict):
+        """ADDED: Load memory from checkpoint."""
+        self.buffer = state['buffer']
+        self.scores = state['scores']
+        self.max_size = state['max_size']
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  LOG CLASSIFICATION TASK
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Log categories
+LOG_CATEGORIES = ["ERROR", "WARNING", "INFO", "DEBUG"]
+NUM_LOG_CLASSES = len(LOG_CATEGORIES)
+
+# Create vocabulary for log messages (reuse character vocab + add digits)
+log_chars = chars + [str(i) for i in range(10)]  # Add 0-9
+log_char2idx = {ch: i for i, ch in enumerate(log_chars)}
+log_idx2char = {i: ch for ch, i in log_char2idx.items()}
+log_vocab_size = len(log_chars)
+
+
+def encode_log(s: str) -> Tensor:
+    """Encode log message string to indices."""
+    return torch.tensor([log_char2idx.get(c, 0) for c in s], dtype=torch.long)
+
+
+def decode_log(t: Tensor) -> str:
+    """Decode indices to log message string."""
+    return "".join(log_idx2char.get(int(i), "_") for i in t)
+
+
+class LogDataset(Dataset):
+    """
+    Synthetic log dataset with temporal patterns and concept drift.
+    Generates realistic system logs across 4 categories.
+    """
+    def __init__(self, n_samples: int, seq_len: int = 50, drift_point: int = None):
+        self.n_samples = n_samples
+        self.seq_len = seq_len
+        self.drift_point = drift_point  # Sample index where distribution shifts
+
+        # Log message templates
+        self.templates = {
+            0: ["ERROR", "FAIL", "CRASH", "EXCEPTION", "NULL"],  # ERROR
+            1: ["WARN", "DEPRECATED", "SLOW", "RETRY"],  # WARNING
+            2: ["INFO", "START", "STOP", "READY"],  # INFO
+            3: ["DEBUG", "TRACE", "VERBOSE"]  # DEBUG
+        }
+
+    def __len__(self):
+        return self.n_samples
+
+    def __getitem__(self, idx):
+        # Introduce concept drift if specified
+        if self.drift_point and idx >= self.drift_point:
+            # After drift: ERROR becomes more common, DEBUG less common
+            class_probs = [0.4, 0.3, 0.2, 0.1]
+        else:
+            # Before drift: balanced distribution
+            class_probs = [0.25, 0.25, 0.25, 0.25]
+
+        # Sample log category
+        category = torch.multinomial(torch.tensor(class_probs), 1).item()
+
+        # Generate log message from template
+        template = self.templates[category][torch.randint(0, len(self.templates[category]), (1,)).item()]
+
+        # Pad or truncate to seq_len
+        if len(template) < self.seq_len:
+            # Pad with underscores
+            message = template + "_" * (self.seq_len - len(template))
+        else:
+            message = template[:self.seq_len]
+
+        # Add some noise (10% character corruption)
+        message_list = list(message)
+        for i in range(len(message_list)):
+            if torch.rand(1).item() < 0.1:
+                message_list[i] = log_chars[torch.randint(0, len(log_chars), (1,)).item()]
+        message = "".join(message_list)
+
+        # Encode message
+        tokens = encode_log(message)
+
+        # Return tokens and category label
+        return tokens, category
+
+
+class RaccoonLogClassifier(nn.Module):
+    """
+    Raccoon-style continuous learning model for log classification.
+    Combines SDE dynamics, normalizing flows, and experience replay.
+    """
+    def __init__(
+        self,
+        vocab_size: int,
+        num_classes: int,
+        latent_dim: int = 32,
+        hidden_dim: int = 64,
+        embed_dim: int = 32,
+        memory_size: int = 5000,
+        adaptation_rate: float = 1e-4,
+    ):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.num_classes = num_classes
+        self.adaptation_rate = adaptation_rate
+
+        # Encoder: tokens → latent distribution
+        self.encoder = nn.Sequential(
+            nn.Embedding(vocab_size, embed_dim),
+            nn.Linear(embed_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+        )
+        self.enc_mean = nn.Linear(hidden_dim, latent_dim)
+        self.enc_logvar = nn.Linear(hidden_dim, latent_dim)
+
+        # SDE dynamics (using new sigma_min/sigma_max parameters)
+        self.dynamics = RaccoonDynamics(latent_dim, hidden_dim, sigma_min=1e-4, sigma_max=1.0)
+
+        # Normalizing flows
+        self.flow = RaccoonFlow(latent_dim, hidden_dim, num_layers=4)
+
+        # Classifier head: latent → class logits
+        self.classifier = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, num_classes)
+        )
+
+        # Latent regularization
+        univariate_test = FastEppsPulley(t_max=5.0, n_points=17)
+        self.latent_test = SlicingUnivariateTest(
+            univariate_test=univariate_test,
+            num_slices=64,
+            reduction="mean",
+        )
+
+        # Experience replay memory
+        self.memory = RaccoonMemory(max_size=memory_size)
+
+        # Learnable prior
+        self.z0_mean = nn.Parameter(torch.zeros(latent_dim))
+        self.z0_logvar = nn.Parameter(torch.zeros(latent_dim))
+
+    def encode(self, tokens: Tensor) -> tuple[Tensor, Tensor]:
+        """
+        Encode tokens to latent distribution.
+
+        Args:
+            tokens: (batch, seq_len)
+        Returns:
+            mean: (batch, latent_dim)
+            logvar: (batch, latent_dim)
+        """
+        # Pool over sequence dimension
+        x = self.encoder(tokens)  # (batch, seq_len, hidden)
+        x = x.mean(dim=1)  # (batch, hidden)
+
+        mean = self.enc_mean(x)
+        logvar = self.enc_logvar(x)
+
+        return mean, logvar
+
+    def sample_latent(self, mean: Tensor, logvar: Tensor) -> Tensor:
+        """Sample from latent distribution using reparameterization trick."""
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mean + eps * std
+
+    def classify(self, z: Tensor) -> Tensor:
+        """Classify from latent representation."""
+        return self.classifier(z)
+
+    def forward(
+        self,
+        tokens: Tensor,
+        labels: Tensor,
+        loss_weights: tuple[float, float, float] = (1.0, 0.1, 0.01),
+    ):
+        """
+        Full forward pass with loss computation.
+
+        Args:
+            tokens: (batch, seq_len)
+            labels: (batch,) class labels
+            loss_weights: (class_loss, kl_loss, ep_loss)
+        Returns:
+            loss: Total loss
+            stats: Dictionary of loss components
+        """
+        batch_size = tokens.shape[0]
+
+        # FIXED: Guard against empty batches
+        if batch_size == 0:
+            return torch.tensor(0.0, device=tokens.device), {
+                "class_loss": torch.tensor(0.0, device=tokens.device),
+                "kl_loss": torch.tensor(0.0, device=tokens.device),
+                "ep_loss": torch.tensor(0.0, device=tokens.device),
+                "accuracy": torch.tensor(0.0, device=tokens.device),
+            }
+
+        # Encode
+        mean, logvar = self.encode(tokens)
+        z = self.sample_latent(mean, logvar)
+
+        # Apply SDE dynamics (short trajectory)
+        t_span = torch.linspace(0.0, 0.1, 3, device=z.device)  # Short time horizon
+        z_traj = solve_sde(self.dynamics, z, t_span)  # (batch, 3, latent)
+        z = z_traj[:, -1, :]  # Take final state
+
+        # Apply normalizing flow
+        t = torch.ones(batch_size, 1, device=z.device) * 0.5  # Mid-time point
+        z_flow, log_det = self.flow(z, t, reverse=False)
+
+        # Classify
+        logits = self.classify(z_flow)
+
+        # Classification loss
+        class_loss = F.cross_entropy(logits, labels)
+
+        # KL divergence to prior
+        # FIXED: Corrected KL formula (was inverted with wrong sign)
+        # KL(q||p) = 0.5 * mean[logvar_p - logvar + (var_q + (mu_p - mu_q)^2)/var_p - 1]
+        var_q = torch.exp(logvar)
+        var_p = torch.exp(self.z0_logvar)
+        kl_loss = 0.5 * torch.mean(
+            self.z0_logvar - logvar +
+            (var_q + (mean - self.z0_mean).pow(2)) / (var_p + 1e-8) -
+            1
+        )
+        # Clamp to ensure non-negative
+        kl_loss = torch.clamp(kl_loss, min=0.0)
+
+        # Epps-Pulley regularization
+        z_for_test = z_flow.unsqueeze(0)  # (1, batch, latent)
+        ep_loss = self.latent_test(z_for_test)
+
+        # Total loss
+        w_class, w_kl, w_ep = loss_weights
+        loss = w_class * class_loss + w_kl * kl_loss + w_ep * ep_loss
+
+        # Accuracy
+        with torch.no_grad():
+            preds = logits.argmax(dim=1)
+            acc = (preds == labels).float().mean()
+
+        stats = {
+            "class_loss": class_loss.detach(),
+            "kl_loss": kl_loss.detach(),
+            "ep_loss": ep_loss.detach(),
+            "accuracy": acc.detach(),
+        }
+
+        return loss, stats
+
+    def continuous_update(self, tokens: Tensor, labels: Tensor):
+        """
+        Perform small online update with memory replay.
+
+        Args:
+            tokens: (batch, seq_len) new observations
+            labels: (batch,) new labels
+        """
+        # Encode and score new data
+        with torch.no_grad():
+            mean, logvar = self.encode(tokens)
+            z = self.sample_latent(mean, logvar)
+            logits = self.classify(z)
+
+            # Quality score = classification confidence
+            probs = F.softmax(logits, dim=1)
+            confidence = probs.max(dim=1).values
+            score = confidence.mean().item()
+
+        # FIXED: Store as dict instead of concatenating tensors
+        # Add to memory (store each sample separately with proper structure)
+        for i in range(tokens.shape[0]):
+            memory_item = {
+                'tokens': tokens[i:i+1].detach().cpu(),  # Keep batch dim
+                'label': labels[i:i+1].detach().cpu()
+            }
+            self.memory.add(memory_item, score)
+
+        # Perform update if enough memory
+        if len(self.memory) >= 32:
+            # Sample from memory
+            memory_batch = self.memory.sample(16, device=tokens.device)
+
+            if len(memory_batch) > 0:
+                # FIXED: Properly extract and concatenate from dict structure
+                device = tokens.device  # Get device from input tokens
+                memory_tokens_list = [m['tokens'].to(device) for m in memory_batch]
+                memory_labels_list = [m['label'].to(device) for m in memory_batch]
+
+                memory_tokens = torch.cat(memory_tokens_list, dim=0)  # (16, seq_len)
+                memory_labels = torch.cat(memory_labels_list, dim=0).squeeze()  # (16,)
+
+                # Combine with new data - shapes now match!
+                all_tokens = torch.cat([tokens, memory_tokens], dim=0)
+                all_labels = torch.cat([labels, memory_labels], dim=0)
+
+                # FIXED: Proper gradient management using optimizer
+                if not hasattr(self, '_adaptation_optimizer'):
+                    self._adaptation_optimizer = torch.optim.SGD(
+                        self.parameters(),
+                        lr=self.adaptation_rate,
+                        momentum=0.0
+                    )
+
+                # Forward pass and gradient update
+                loss, _ = self.forward(all_tokens, all_labels)
+                self._adaptation_optimizer.zero_grad()
+                loss.backward()
+                self._adaptation_optimizer.step()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  TRAINING LOOPS
+# ──────────────────────────────────────────────────────────────────────────────
+
+def train_raccoon_classifier(
+    model: RaccoonLogClassifier,
+    dataloader: DataLoader,
+    n_iter: int,
+    device: torch.device,
+    loss_weights: tuple[float, float, float] = (1.0, 0.1, 0.01),
+):
+    """
+    Phase 1: Initial supervised training.
+    """
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-5)
+
+    pbar = trange(n_iter, desc="Phase 1: Initial Training")
+    data_iter = iter(dataloader)
+
+    for step in pbar:
+        try:
+            tokens, labels = next(data_iter)
+        except StopIteration:
+            data_iter = iter(dataloader)
+            tokens, labels = next(data_iter)
+
+        tokens = tokens.to(device)
+        labels = labels.to(device)
+
+        # Forward pass
+        model.train()
+        loss, stats = model(tokens, labels, loss_weights=loss_weights)
+
+        # Backward pass
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        # Logging
+        pbar.set_postfix({
+            "loss": f"{loss.item():.4f}",
+            "acc": f"{stats['accuracy']:.3f}",
+            "class": f"{stats['class_loss']:.3f}",
+            "kl": f"{stats['kl_loss']:.3f}",
+        })
+
+    print("\n✅ Phase 1 complete!")
+
+
+def continuous_learning_phase(
+    model: RaccoonLogClassifier,
+    dataloader: DataLoader,
+    n_samples: int,
+    device: torch.device,
+):
+    """
+    Phase 2: Continuous learning with online adaptation.
+    """
+    model.eval()  # Eval mode for base model, updates happen in continuous_update
+
+    pbar = trange(n_samples, desc="Phase 2: Continuous Learning")
+    data_iter = iter(dataloader)
+
+    accuracies = []
+
+    for step in pbar:
+        try:
+            tokens, labels = next(data_iter)
+        except StopIteration:
+            data_iter = iter(dataloader)
+            tokens, labels = next(data_iter)
+
+        # Take only one sample for online learning
+        tokens = tokens[:1].to(device)
+        labels = labels[:1].to(device)
+
+        # Evaluate before update
+        with torch.no_grad():
+            mean, logvar = model.encode(tokens)
+            z = model.sample_latent(mean, logvar)
+            logits = model.classify(z)
+            pred = logits.argmax(dim=1)
+            correct = (pred == labels).float().item()
+            accuracies.append(correct)
+
+        # Continuous update
+        model.continuous_update(tokens, labels)
+
+        # Logging
+        if step % 10 == 0:
+            recent_acc = sum(accuracies[-100:]) / min(100, len(accuracies))
+            pbar.set_postfix({
+                "memory": len(model.memory),
+                "acc": f"{recent_acc:.3f}",
+            })
+
+    print(f"\n✅ Phase 2 complete! Final memory size: {len(model.memory)}")
+    print(f"📊 Final 100-sample accuracy: {sum(accuracies[-100:])/100:.3f}")
+
+
 if __name__ == "__main__":
-    if torch.backends.mps.is_available():
-        device = torch.device("mps")
-    else:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Force CPU for compatibility
+    device = torch.device("cpu")
+    print(f"🦝 Raccoon-in-a-Bungeecord Log Classifier")
+    print(f"🖥️  Device: {device}")
 
-    # quick sanity check on dataset
-    ds = SyntheticTargetDataset(n_samples=100_000)
-    x0 = ds[0]
-    print("Example synthetic sequence:")
-    print(decode(x0))
+    # Test original ODE model (optional)
+    run_original_ode = False
+    if run_original_ode:
+        print("\n" + "="*70)
+        print("RUNNING ORIGINAL ODE MODEL (Character Task)")
+        print("="*70)
 
-    batch_size = 128
-    seq_len = 64
-    latent_size = 64
-    hidden_size = 128
-    embed_size = 64
+        ds = SyntheticTargetDataset(n_samples=100_000)
+        x0 = ds[0]
+        print("Example synthetic sequence:")
+        print(decode(x0))
 
-    dataloader = DataLoader(ds, batch_size=batch_size, shuffle=True, drop_last=True)
+        batch_size = 128
+        seq_len = 64
+        latent_size = 64
+        hidden_size = 128
+        embed_size = 64
 
-    def weight_init(m):
-        if isinstance(m, nn.Linear):
-            nn.init.trunc_normal_(m.weight, std=0.02)
-            if m.bias is not None:
+        dataloader = DataLoader(ds, batch_size=batch_size, shuffle=True, drop_last=True)
+
+        def weight_init(m):
+            if isinstance(m, nn.Linear):
+                nn.init.trunc_normal_(m.weight, std=0.02)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.LayerNorm):
+                nn.init.ones_(m.weight)
                 nn.init.zeros_(m.bias)
-        elif isinstance(m, nn.LayerNorm):
-            nn.init.ones_(m.weight)
-            nn.init.zeros_(m.bias)
 
-    model = DeterministicLatentODE(
-        vocab_size=vocab_size,
-        latent_size=latent_size,
-        hidden_size=hidden_size,
-        embed_size=embed_size,
-        num_slices=1024,
+        model_ode = DeterministicLatentODE(
+            vocab_size=vocab_size,
+            latent_size=latent_size,
+            hidden_size=hidden_size,
+            embed_size=embed_size,
+            num_slices=1024,
+        ).to(device)
+
+        model_ode.apply(weight_init)
+
+        train_steps = 1000  # Reduced for testing
+        train_ode(model_ode, dataloader, train_steps, device)
+
+    # Run Raccoon log classifier
+    print("\n" + "="*70)
+    print("RUNNING RACCOON LOG CLASSIFIER (Continuous Learning)")
+    print("="*70)
+
+    # Create log dataset
+    print("\n📝 Creating log dataset...")
+    train_ds = LogDataset(n_samples=5000, seq_len=50, drift_point=None)
+    test_ds = LogDataset(n_samples=1000, seq_len=50, drift_point=None)
+    drift_ds = LogDataset(n_samples=1000, seq_len=50, drift_point=500)  # Concept drift
+
+    # Show examples
+    print("\n📋 Example logs:")
+    for i in range(4):
+        tokens, label = train_ds[i]
+        message = decode_log(tokens)
+        print(f"  [{LOG_CATEGORIES[label]}] {message}")
+
+    train_loader = DataLoader(train_ds, batch_size=32, shuffle=True, drop_last=True)
+    test_loader = DataLoader(test_ds, batch_size=32, shuffle=False)
+    drift_loader = DataLoader(drift_ds, batch_size=1, shuffle=True)
+
+    # Create Raccoon model
+    print("\n🦝 Initializing Raccoon model...")
+    model = RaccoonLogClassifier(
+        vocab_size=log_vocab_size,
+        num_classes=NUM_LOG_CLASSES,
+        latent_dim=32,
+        hidden_dim=64,
+        embed_dim=32,
+        memory_size=2000,
+        adaptation_rate=1e-4,
     ).to(device)
 
-    model.apply(weight_init)
+    param_count = sum(p.numel() for p in model.parameters())
+    print(f"📊 Model parameters: {param_count:,}")
 
-    train_steps = 100_000
-    train_ode(model, dataloader, train_steps, device)
+    # Phase 1: Initial training
+    print("\n🏋️ Starting Phase 1: Initial Training...")
+    train_raccoon_classifier(
+        model=model,
+        dataloader=train_loader,
+        n_iter=1000,
+        device=device,
+        loss_weights=(1.0, 0.1, 0.01),
+    )
+
+    # Evaluate on test set
+    print("\n📊 Evaluating on test set...")
+    model.eval()
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for tokens, labels in test_loader:
+            tokens = tokens.to(device)
+            labels = labels.to(device)
+
+            mean, logvar = model.encode(tokens)
+            z = model.sample_latent(mean, logvar)
+            logits = model.classify(z)
+            preds = logits.argmax(dim=1)
+
+            correct += (preds == labels).sum().item()
+            total += labels.size(0)
+
+    print(f"✅ Test Accuracy: {correct/total:.3f} ({correct}/{total})")
+
+    # Phase 2: Continuous learning
+    print("\n🔄 Starting Phase 2: Continuous Learning...")
+    continuous_learning_phase(
+        model=model,
+        dataloader=drift_loader,
+        n_samples=1000,
+        device=device,
+    )
+
+    # Final evaluation
+    print("\n📊 Final evaluation after continuous learning...")
+    model.eval()
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for tokens, labels in test_loader:
+            tokens = tokens.to(device)
+            labels = labels.to(device)
+
+            mean, logvar = model.encode(tokens)
+            z = model.sample_latent(mean, logvar)
+            logits = model.classify(z)
+            preds = logits.argmax(dim=1)
+
+            correct += (preds == labels).sum().item()
+            total += labels.size(0)
+
+    print(f"✅ Final Test Accuracy: {correct/total:.3f} ({correct}/{total})")
+    print(f"📦 Memory Buffer Size: {len(model.memory)}")
+
+    print("\n" + "="*70)
+    print("🎉 RACCOON-IN-A-BUNGEECORD TRAINING COMPLETE!")
+    print("="*70)
+    print(f"\n✨ Successfully implemented:")
+    print("  ✅ SDE Dynamics (drift + diffusion)")
+    print("  ✅ Normalizing Flows (4 coupling layers)")
+    print("  ✅ Experience Replay Memory")
+    print("  ✅ Continuous Learning")
+    print("  ✅ Multi-scale Time Embedding")
+    print("  ✅ Epps-Pulley Regularization")
+    print("\n🦝 The Raccoon has learned to bounce continuously!")
 

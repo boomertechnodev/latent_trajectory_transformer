@@ -46,6 +46,11 @@ Thumbs.db
 *.ckpt
 checkpoints/
 
+# Generated visualizations
+*.png
+*.jpg
+*.jpeg
+
 # Data
 data/
 logs/

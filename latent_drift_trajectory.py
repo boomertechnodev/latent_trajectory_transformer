@@ -839,7 +839,7 @@ def train_ode(
     dataloader: DataLoader,
     n_iter: int,
     device: torch.device,
-    loss_weights: tuple[float, float, float] = (1.0, 0.0005, 1.0),
+    loss_weights: tuple[float, float, float] = (1.0, 0.05, 1.0),
 ):
     optim = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-5)
 

@@ -229,13 +229,35 @@ class UniversalTokenizer:
             if comment_match:
                 return comment_match.group(1).strip()
 
+            # FALLBACK: Extract function/class names as description
+            func_names = metadata.get('function_names', [])
+            class_names = metadata.get('class_names', [])
+            if func_names or class_names:
+                parts = []
+                if class_names:
+                    parts.append(f"Defines {', '.join(class_names[:3])}")
+                if func_names:
+                    parts.append(f"implements {', '.join(func_names[:3])}")
+                if parts:
+                    return '. '.join(parts)
+
+            # ULTIMATE FALLBACK: Use first 150 chars of code as proxy
+            clean_text = ' '.join(text.split()[:30])  # First 30 tokens
+            if len(clean_text) > 20:
+                return clean_text[:150]
+
         elif ext == '.md':
             # Use headers as explanations
             header_match = re.search(r'^#{1,6}\s+(.+?)$', text, re.MULTILINE)
             if header_match:
                 return header_match.group(1).strip()
 
-        return None
+            # FALLBACK: First sentence
+            sentences = re.split(r'[.!?]\s+', text)
+            if sentences and len(sentences[0]) > 10:
+                return sentences[0][:150]
+
+        return text[:150] if len(text) > 20 else None  # Last resort: use code itself
 
 
 class NeuralCodeSearchModel(nn.Module):

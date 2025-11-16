@@ -54,3 +54,5 @@ outputs/
 # IMPORTANT: DO NOT IGNORE .claude folder (Opus 4 ultrathink config)
 !.claude/
 !.claude/**
+*.index
+__pycache__/

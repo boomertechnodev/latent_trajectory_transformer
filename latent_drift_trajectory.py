@@ -488,11 +488,6 @@ class PosteriorEncoder(nn.Module):
         return x
 
 
-import torch
-from torch import nn, Tensor
-import torch.nn.functional as F
-
-
 class DeterministicEncoder(nn.Module):
     """
     Deterministic latent encoder: tokens → latent sequence z_{0:L-1}.

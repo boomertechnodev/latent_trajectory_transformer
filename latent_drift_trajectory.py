@@ -650,6 +650,365 @@ class TransformerBlock(nn.Module):
 
         return r
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Llama2 Transformer Components (Karpathy's llama2.c architecture)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class RMSNorm(nn.Module):
+    """Root Mean Square Layer Normalization (more efficient than LayerNorm)."""
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: Tensor) -> Tensor:
+        # x: (B, T, D)
+        # RMS = sqrt(mean(x^2) + eps)
+        rms = torch.sqrt(torch.mean(x ** 2, dim=-1, keepdim=True) + self.eps)
+        return x / rms * self.weight
+
+
+def precompute_freqs_cis(dim: int, seq_len: int, theta: float = 10000.0, device='cpu') -> Tensor:
+    """
+    Precompute complex exponentials for RoPE (Rotary Position Embedding).
+
+    Returns: (seq_len, dim//2) complex tensor with rotation frequencies
+    """
+    # Compute frequencies for each dimension pair
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, device=device)[: (dim // 2)].float() / dim))
+
+    # Create position indices
+    t = torch.arange(seq_len, device=device)
+
+    # Outer product: (seq_len, dim//2)
+    freqs = torch.outer(t, freqs).float()
+
+    # Convert to complex exponentials (cos + i*sin)
+    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # e^(i*theta) = cos(theta) + i*sin(theta)
+
+    return freqs_cis
+
+
+def apply_rotary_emb(xq: Tensor, xk: Tensor, freqs_cis: Tensor) -> tuple[Tensor, Tensor]:
+    """
+    Apply rotary position embeddings to query and key tensors.
+
+    Args:
+        xq: Query tensor (B, T, n_heads, head_dim)
+        xk: Key tensor (B, T, n_kv_heads, head_dim)
+        freqs_cis: Precomputed frequencies (T, head_dim//2)
+
+    Returns:
+        (xq_rotated, xk_rotated) with same shapes as input
+    """
+    # Reshape xq and xk to complex numbers (treating pairs of dims as real/imag)
+    # (B, T, n_heads, head_dim) -> (B, T, n_heads, head_dim//2, 2) -> (B, T, n_heads, head_dim//2)
+    xq_complex = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
+    xk_complex = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
+
+    # freqs_cis: (T, head_dim//2) -> (1, T, 1, head_dim//2) for broadcasting
+    freqs_cis = freqs_cis.unsqueeze(0).unsqueeze(2)
+
+    # Element-wise complex multiplication (rotation)
+    xq_rotated = torch.view_as_real(xq_complex * freqs_cis).flatten(-2)
+    xk_rotated = torch.view_as_real(xk_complex * freqs_cis).flatten(-2)
+
+    return xq_rotated.type_as(xq), xk_rotated.type_as(xk)
+
+
+def repeat_kv(x: Tensor, n_rep: int) -> Tensor:
+    """
+    Repeat key/value heads to match number of query heads (for GQA).
+
+    Args:
+        x: (B, T, n_kv_heads, head_dim)
+        n_rep: Number of times to repeat each KV head
+
+    Returns:
+        (B, T, n_kv_heads * n_rep, head_dim)
+    """
+    if n_rep == 1:
+        return x
+
+    B, T, n_kv_heads, head_dim = x.shape
+
+    # Expand and reshape: (B, T, n_kv_heads, n_rep, head_dim) -> (B, T, n_kv_heads * n_rep, head_dim)
+    return x.unsqueeze(3).expand(B, T, n_kv_heads, n_rep, head_dim).reshape(B, T, n_kv_heads * n_rep, head_dim)
+
+
+class LlamaAttention(nn.Module):
+    """Multi-head attention with RoPE and GQA (Grouped Query Attention)."""
+
+    def __init__(self, dim: int, n_heads: int, n_kv_heads: int, dropout: float = 0.0):
+        super().__init__()
+        self.n_heads = n_heads
+        self.n_kv_heads = n_kv_heads
+        self.n_rep = n_heads // n_kv_heads  # How many times to repeat each KV head
+        self.head_dim = dim // n_heads
+        self.dropout = dropout
+
+        # QKV projections (note: KV heads may be fewer than Q heads)
+        self.wq = nn.Linear(dim, n_heads * self.head_dim, bias=False)
+        self.wk = nn.Linear(dim, n_kv_heads * self.head_dim, bias=False)
+        self.wv = nn.Linear(dim, n_kv_heads * self.head_dim, bias=False)
+        self.wo = nn.Linear(n_heads * self.head_dim, dim, bias=False)
+
+    def forward(self, x: Tensor, freqs_cis: Tensor, mask: Tensor | None = None) -> Tensor:
+        """
+        Args:
+            x: (B, T, dim)
+            freqs_cis: (T, head_dim//2) precomputed RoPE frequencies
+            mask: Optional (T, T) causal mask
+
+        Returns:
+            (B, T, dim)
+        """
+        B, T, _ = x.shape
+
+        # QKV projections
+        xq = self.wq(x)  # (B, T, n_heads * head_dim)
+        xk = self.wk(x)  # (B, T, n_kv_heads * head_dim)
+        xv = self.wv(x)  # (B, T, n_kv_heads * head_dim)
+
+        # Reshape to separate heads
+        xq = xq.view(B, T, self.n_heads, self.head_dim)      # (B, T, n_heads, head_dim)
+        xk = xk.view(B, T, self.n_kv_heads, self.head_dim)   # (B, T, n_kv_heads, head_dim)
+        xv = xv.view(B, T, self.n_kv_heads, self.head_dim)   # (B, T, n_kv_heads, head_dim)
+
+        # Apply RoPE to Q and K
+        xq, xk = apply_rotary_emb(xq, xk, freqs_cis)
+
+        # Repeat KV heads if using GQA (n_kv_heads < n_heads)
+        if self.n_rep > 1:
+            xk = repeat_kv(xk, self.n_rep)  # (B, T, n_heads, head_dim)
+            xv = repeat_kv(xv, self.n_rep)  # (B, T, n_heads, head_dim)
+
+        # Transpose for attention computation
+        xq = xq.transpose(1, 2)  # (B, n_heads, T, head_dim)
+        xk = xk.transpose(1, 2)  # (B, n_heads, T, head_dim)
+        xv = xv.transpose(1, 2)  # (B, n_heads, T, head_dim)
+
+        # Compute attention scores
+        scores = torch.matmul(xq, xk.transpose(-2, -1)) / math.sqrt(self.head_dim)  # (B, n_heads, T, T)
+
+        # Apply causal mask if provided
+        if mask is not None:
+            scores = scores + mask  # mask contains -inf for positions to mask
+
+        # Softmax and dropout
+        attn = F.softmax(scores, dim=-1)
+        attn = F.dropout(attn, p=self.dropout, training=self.training)
+
+        # Apply attention to values
+        out = torch.matmul(attn, xv)  # (B, n_heads, T, head_dim)
+
+        # Concatenate heads and project
+        out = out.transpose(1, 2).contiguous().view(B, T, -1)  # (B, T, n_heads * head_dim)
+        return self.wo(out)
+
+
+class LlamaFeedForward(nn.Module):
+    """SwiGLU feedforward network (Llama2 style)."""
+
+    def __init__(self, dim: int, hidden_dim: int, dropout: float = 0.0):
+        super().__init__()
+        self.w1 = nn.Linear(dim, hidden_dim, bias=False)  # Gate projection
+        self.w2 = nn.Linear(hidden_dim, dim, bias=False)  # Down projection
+        self.w3 = nn.Linear(dim, hidden_dim, bias=False)  # Up projection
+        self.dropout = dropout
+
+    def forward(self, x: Tensor) -> Tensor:
+        # SwiGLU: swish(w1(x)) * w3(x), then w2
+        return self.w2(F.dropout(F.silu(self.w1(x)) * self.w3(x), p=self.dropout, training=self.training))
+
+
+class LlamaTransformerBlock(nn.Module):
+    """Llama2 transformer block: RMSNorm + Attention + RMSNorm + FFN."""
+
+    def __init__(self, dim: int, n_heads: int, n_kv_heads: int, hidden_dim: int, dropout: float = 0.0):
+        super().__init__()
+        self.attention = LlamaAttention(dim, n_heads, n_kv_heads, dropout)
+        self.feed_forward = LlamaFeedForward(dim, hidden_dim, dropout)
+        self.attention_norm = RMSNorm(dim)
+        self.ffn_norm = RMSNorm(dim)
+
+    def forward(self, x: Tensor, freqs_cis: Tensor, mask: Tensor | None = None) -> Tensor:
+        """
+        Args:
+            x: (B, T, dim)
+            freqs_cis: (T, head_dim//2)
+            mask: Optional (T, T) causal mask
+        """
+        # Pre-norm attention with residual
+        h = x + self.attention(self.attention_norm(x), freqs_cis, mask)
+
+        # Pre-norm FFN with residual
+        out = h + self.feed_forward(self.ffn_norm(h))
+
+        return out
+
+
+class Llama2Transformer(nn.Module):
+    """
+    Complete Llama2-style transformer for language modeling.
+
+    Architecture matches Karpathy's llama2.c but sized for TinyStories:
+    - dim=512, n_layers=8, n_heads=8, n_kv_heads=8 (or fewer for GQA)
+    - RMSNorm instead of LayerNorm
+    - RoPE instead of absolute positional encoding
+    - SwiGLU instead of ReLU FFN
+    - Weight tying between token embeddings and output projection
+    """
+
+    def __init__(
+        self,
+        vocab_size: int,
+        dim: int = 512,
+        n_layers: int = 8,
+        n_heads: int = 8,
+        n_kv_heads: int = 8,  # Set < n_heads for GQA
+        hidden_dim: int | None = None,
+        max_seq_len: int = 512,
+        dropout: float = 0.0,
+        rope_theta: float = 10000.0,
+    ):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.dim = dim
+        self.n_layers = n_layers
+        self.max_seq_len = max_seq_len
+
+        # Default hidden_dim to 4*dim (standard transformer ratio)
+        if hidden_dim is None:
+            hidden_dim = 4 * dim
+
+        # Token embeddings
+        self.tok_embeddings = nn.Embedding(vocab_size, dim)
+
+        # Transformer layers
+        self.layers = nn.ModuleList([
+            LlamaTransformerBlock(dim, n_heads, n_kv_heads, hidden_dim, dropout)
+            for _ in range(n_layers)
+        ])
+
+        # Final norm and output projection
+        self.norm = RMSNorm(dim)
+        self.output = nn.Linear(dim, vocab_size, bias=False)
+
+        # Weight tying: share embeddings with output projection
+        self.output.weight = self.tok_embeddings.weight
+
+        # Precompute RoPE frequencies
+        head_dim = dim // n_heads
+        self.register_buffer(
+            'freqs_cis',
+            precompute_freqs_cis(head_dim, max_seq_len, rope_theta, device='cpu'),
+            persistent=False
+        )
+
+        # Initialize weights
+        self.apply(self._init_weights)
+
+        # Apply special scaled init to residual projections (GPT-2 paper)
+        for name, param in self.named_parameters():
+            if name.endswith('w2.weight') or name.endswith('wo.weight'):
+                # Scale by 1/sqrt(2*n_layers) as per GPT-2
+                torch.nn.init.normal_(param, mean=0.0, std=0.02 / math.sqrt(2 * n_layers))
+
+    def _init_weights(self, module):
+        """Initialize weights following GPT-2 / Llama2 conventions."""
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def forward(self, tokens: Tensor, targets: Tensor | None = None) -> tuple[Tensor, Tensor | None]:
+        """
+        Args:
+            tokens: (B, T) input token IDs
+            targets: (B, T) target token IDs for loss computation (optional)
+
+        Returns:
+            logits: (B, T, vocab_size)
+            loss: scalar if targets provided, else None
+        """
+        B, T = tokens.shape
+
+        # Ensure sequence length doesn't exceed max
+        assert T <= self.max_seq_len, f"Sequence length {T} exceeds max {self.max_seq_len}"
+
+        # Token embeddings
+        h = self.tok_embeddings(tokens)  # (B, T, dim)
+
+        # Get RoPE frequencies for current sequence length
+        freqs_cis = self.freqs_cis[:T].to(h.device)
+
+        # Create causal mask: (T, T) with -inf for future positions
+        mask = torch.full((T, T), float('-inf'), device=h.device)
+        mask = torch.triu(mask, diagonal=1)  # Upper triangular part = -inf
+
+        # Apply transformer layers
+        for layer in self.layers:
+            h = layer(h, freqs_cis, mask)
+
+        # Final norm and output projection
+        h = self.norm(h)
+        logits = self.output(h)  # (B, T, vocab_size)
+
+        # Compute loss if targets provided
+        loss = None
+        if targets is not None:
+            # Flatten for cross-entropy
+            loss = F.cross_entropy(
+                logits.view(-1, self.vocab_size),
+                targets.view(-1),
+                ignore_index=-1  # Standard padding token
+            )
+
+        return logits, loss
+
+    def generate(self, tokens: Tensor, max_new_tokens: int, temperature: float = 1.0, top_k: int | None = None) -> Tensor:
+        """
+        Autoregressive generation.
+
+        Args:
+            tokens: (B, T) initial token IDs
+            max_new_tokens: Number of new tokens to generate
+            temperature: Sampling temperature (higher = more random)
+            top_k: If set, only sample from top-k most likely tokens
+
+        Returns:
+            (B, T + max_new_tokens) generated sequence
+        """
+        for _ in range(max_new_tokens):
+            # Truncate to max_seq_len if needed
+            tokens_cond = tokens if tokens.size(1) <= self.max_seq_len else tokens[:, -self.max_seq_len:]
+
+            # Forward pass
+            logits, _ = self.forward(tokens_cond)
+
+            # Get logits for last position
+            logits = logits[:, -1, :] / temperature  # (B, vocab_size)
+
+            # Optional top-k filtering
+            if top_k is not None:
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < v[:, [-1]]] = float('-inf')
+
+            # Sample from distribution
+            probs = F.softmax(logits, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)  # (B, 1)
+
+            # Append to sequence
+            tokens = torch.cat([tokens, next_token], dim=1)
+
+        return tokens
+
+
 class Predictor(nn.Module):
     def __init__(self, latent_size: int, hidden_size: int):
         super().__init__()

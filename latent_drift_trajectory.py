@@ -1009,6 +1009,465 @@ class Llama2Transformer(nn.Module):
         return tokens
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+#  Dataset and Benchmarking Infrastructure for TinyStories Training
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class SimpleTokenizer:
+    """
+    Simple character-level or BPE-like tokenizer for TinyStories.
+
+    Uses whitespace + punctuation splitting with a learned vocabulary.
+    Fallback when SentencePiece tokenizer.model is not available.
+    """
+    def __init__(self, vocab_size: int = 10000):
+        self.vocab_size = vocab_size
+        self.token_to_id = {}
+        self.id_to_token = {}
+
+        # Special tokens
+        self.PAD_ID = 0
+        self.BOS_ID = 1
+        self.EOS_ID = 2
+        self.UNK_ID = 3
+
+        self.token_to_id['<PAD>'] = self.PAD_ID
+        self.token_to_id['<BOS>'] = self.BOS_ID
+        self.token_to_id['<EOS>'] = self.EOS_ID
+        self.token_to_id['<UNK>'] = self.UNK_ID
+
+        for i in range(4):
+            self.id_to_token[i] = list(self.token_to_id.keys())[i]
+
+    def train(self, texts: list[str]):
+        """Build vocabulary from list of texts."""
+        from collections import Counter
+        import re
+
+        # Tokenize by splitting on whitespace and keeping punctuation
+        all_tokens = []
+        for text in texts:
+            # Split on whitespace, keep punctuation as separate tokens
+            tokens = re.findall(r'\w+|[^\w\s]', text.lower())
+            all_tokens.extend(tokens)
+
+        # Count frequencies and take top vocab_size - 4 (for special tokens)
+        token_counts = Counter(all_tokens)
+        most_common = token_counts.most_common(self.vocab_size - 4)
+
+        # Build vocabulary
+        for idx, (token, _) in enumerate(most_common, start=4):
+            self.token_to_id[token] = idx
+            self.id_to_token[idx] = token
+
+    def encode(self, text: str) -> list[int]:
+        """Convert text to list of token IDs."""
+        import re
+        tokens = re.findall(r'\w+|[^\w\s]', text.lower())
+        return [self.BOS_ID] + [
+            self.token_to_id.get(token, self.UNK_ID) for token in tokens
+        ] + [self.EOS_ID]
+
+    def decode(self, ids: list[int]) -> str:
+        """Convert list of token IDs back to text."""
+        tokens = []
+        for id in ids:
+            if id in [self.PAD_ID, self.BOS_ID, self.EOS_ID]:
+                continue
+            token = self.id_to_token.get(id, '<UNK>')
+            tokens.append(token)
+        return ' '.join(tokens)
+
+
+class TinyStoriesDataset:
+    """
+    Dataset loader for TinyStories text file.
+
+    Loads stories from text file separated by <|endoftext|> markers,
+    tokenizes them, and provides batches for training.
+    """
+    def __init__(
+        self,
+        file_path: str,
+        tokenizer: SimpleTokenizer,
+        seq_len: int = 256,
+        split: str = 'train',  # 'train' or 'val'
+        train_split: float = 0.9,
+    ):
+        self.file_path = file_path
+        self.tokenizer = tokenizer
+        self.seq_len = seq_len
+        self.split = split
+
+        # Load and tokenize stories
+        print(f"Loading TinyStories from {file_path}...")
+        with open(file_path, 'r', encoding='utf-8') as f:
+            text = f.read()
+
+        # Split into individual stories
+        stories = text.split('<|endoftext|>')
+        stories = [s.strip() for s in stories if s.strip()]
+
+        print(f"Found {len(stories)} stories")
+
+        # Train/val split
+        split_idx = int(len(stories) * train_split)
+        if split == 'train':
+            self.stories = stories[:split_idx]
+        else:
+            self.stories = stories[split_idx:]
+
+        print(f"{split.capitalize()} set: {len(self.stories)} stories")
+
+        # Tokenize all stories
+        print("Tokenizing stories...")
+        self.token_ids = []
+        for story in self.stories:
+            ids = tokenizer.encode(story)
+            self.token_ids.extend(ids)
+
+        print(f"Total tokens: {len(self.token_ids):,}")
+
+        # Calculate number of sequences
+        self.num_sequences = len(self.token_ids) // seq_len
+
+    def __len__(self):
+        return self.num_sequences
+
+    def __getitem__(self, idx):
+        """
+        Get a single training example.
+
+        Returns:
+            tokens: (seq_len,) input sequence
+            targets: (seq_len,) target sequence (shifted by 1)
+        """
+        start_idx = idx * self.seq_len
+        end_idx = start_idx + self.seq_len + 1  # +1 for target
+
+        # Get sequence
+        if end_idx > len(self.token_ids):
+            # Wrap around if at end
+            sequence = self.token_ids[start_idx:] + self.token_ids[:end_idx - len(self.token_ids)]
+        else:
+            sequence = self.token_ids[start_idx:end_idx]
+
+        # Pad if needed
+        if len(sequence) < self.seq_len + 1:
+            sequence = sequence + [self.tokenizer.PAD_ID] * (self.seq_len + 1 - len(sequence))
+
+        # Convert to tensors
+        tokens = torch.tensor(sequence[:-1], dtype=torch.long)    # Input: [0:seq_len]
+        targets = torch.tensor(sequence[1:], dtype=torch.long)     # Target: [1:seq_len+1]
+
+        return tokens, targets
+
+
+class BenchmarkRunner:
+    """
+    Unified training framework for fair model comparison.
+
+    Ensures identical conditions for Llama2 vs Raccoon:
+    - Same dataset and batching
+    - Same hyperparameters (lr, batch_size, seq_len)
+    - Same optimizer configuration
+    - Same evaluation protocol
+    - Detailed timing and memory tracking
+    """
+    def __init__(
+        self,
+        model_factory,  # Callable that returns a model instance
+        train_dataset,
+        val_dataset,
+        config: dict,
+        device='cpu',
+    ):
+        """
+        Args:
+            model_factory: Callable() -> nn.Module
+            train_dataset: TinyStoriesDataset for training
+            val_dataset: TinyStoriesDataset for validation
+            config: Dict with keys:
+                - batch_size: int (default 32)
+                - seq_len: int (default 256)
+                - num_iterations: int (default 10000)
+                - learning_rate: float (default 5e-4)
+                - min_lr: float (default 5e-5)
+                - warmup_steps: int (default 500)
+                - weight_decay: float (default 0.1)
+                - grad_clip: float (default 1.0)
+                - eval_interval: int (default 500)
+                - log_interval: int (default 100)
+                - num_runs: int (default 1) for statistical rigor
+            device: 'cpu' or 'cuda'
+        """
+        self.model_factory = model_factory
+        self.train_dataset = train_dataset
+        self.val_dataset = val_dataset
+        self.config = config
+        self.device = device
+
+        # Extract hyperparameters
+        self.batch_size = config.get('batch_size', 32)
+        self.seq_len = config.get('seq_len', 256)
+        self.num_iterations = config.get('num_iterations', 10000)
+        self.learning_rate = config.get('learning_rate', 5e-4)
+        self.min_lr = config.get('min_lr', 5e-5)
+        self.warmup_steps = config.get('warmup_steps', 500)
+        self.weight_decay = config.get('weight_decay', 0.1)
+        self.grad_clip = config.get('grad_clip', 1.0)
+        self.eval_interval = config.get('eval_interval', 500)
+        self.log_interval = config.get('log_interval', 100)
+        self.num_runs = config.get('num_runs', 1)
+
+        # Results storage
+        self.results = []
+
+    def get_cosine_lr(self, it: int) -> float:
+        """Cosine learning rate schedule with warmup."""
+        if it < self.warmup_steps:
+            # Linear warmup
+            return self.learning_rate * it / self.warmup_steps
+        # Cosine decay
+        decay_ratio = (it - self.warmup_steps) / (self.num_iterations - self.warmup_steps)
+        coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+        return self.min_lr + coeff * (self.learning_rate - self.min_lr)
+
+    def evaluate(self, model, max_batches: int = 50):
+        """Evaluate model on validation set."""
+        model.eval()
+        total_loss = 0.0
+        num_batches = 0
+
+        # Create dataloader for validation
+        val_loader = torch.utils.data.DataLoader(
+            self.val_dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
+        )
+
+        with torch.no_grad():
+            for tokens, targets in val_loader:
+                if num_batches >= max_batches:
+                    break
+
+                tokens = tokens.to(self.device)
+                targets = targets.to(self.device)
+
+                # Forward pass (handle different model APIs)
+                if hasattr(model, 'forward') and 'targets' in model.forward.__code__.co_varnames:
+                    # Llama2Transformer style
+                    logits, loss = model(tokens, targets)
+                else:
+                    # Raccoon style
+                    logits = model(tokens)
+                    loss = F.cross_entropy(
+                        logits.view(-1, logits.size(-1)),
+                        targets.view(-1),
+                        ignore_index=-1
+                    )
+
+                total_loss += loss.item()
+                num_batches += 1
+
+        model.train()
+        return total_loss / num_batches if num_batches > 0 else 0.0
+
+    def run_training(self, seed: int = 42):
+        """
+        Run one complete training run.
+
+        Returns:
+            metrics: Dict with timing, loss curves, final perplexity, etc.
+        """
+        import time
+        import psutil
+
+        # Set random seed
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed(seed)
+
+        # Create model
+        print(f"\n{'='*60}")
+        print(f"Training run with seed={seed}")
+        print(f"{'='*60}")
+
+        model = self.model_factory()
+        model = model.to(self.device)
+        model.train()
+
+        # Count parameters
+        num_params = sum(p.numel() for p in model.parameters())
+        print(f"Model parameters: {num_params:,}")
+
+        # Create optimizer (separate weight decay groups)
+        decay_params = []
+        no_decay_params = []
+        for name, param in model.named_parameters():
+            if 'weight' in name and ('norm' not in name.lower() and 'bias' not in name):
+                decay_params.append(param)
+            else:
+                no_decay_params.append(param)
+
+        optimizer = torch.optim.AdamW([
+            {'params': decay_params, 'weight_decay': self.weight_decay},
+            {'params': no_decay_params, 'weight_decay': 0.0}
+        ], lr=self.learning_rate, betas=(0.9, 0.95))
+
+        # Create dataloader
+        train_loader = torch.utils.data.DataLoader(
+            self.train_dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            drop_last=True,
+        )
+        data_iter = iter(train_loader)
+
+        # Tracking
+        train_losses = []
+        val_losses = []
+        iter_times = []
+        memory_usage = []
+
+        process = psutil.Process()
+
+        # Training loop
+        print(f"\nTraining for {self.num_iterations} iterations...")
+
+        for step in range(self.num_iterations):
+            iter_start = time.time()
+
+            # Get batch
+            try:
+                tokens, targets = next(data_iter)
+            except StopIteration:
+                data_iter = iter(train_loader)
+                tokens, targets = next(data_iter)
+
+            tokens = tokens.to(self.device)
+            targets = targets.to(self.device)
+
+            # Update learning rate
+            lr = self.get_cosine_lr(step)
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = lr
+
+            # Forward pass
+            if hasattr(model, 'forward') and 'targets' in model.forward.__code__.co_varnames:
+                logits, loss = model(tokens, targets)
+            else:
+                logits = model(tokens)
+                loss = F.cross_entropy(
+                    logits.view(-1, logits.size(-1)),
+                    targets.view(-1),
+                    ignore_index=-1
+                )
+
+            # Backward pass
+            optimizer.zero_grad()
+            loss.backward()
+
+            # Gradient clipping
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), self.grad_clip)
+
+            # Check for NaN gradients
+            if torch.isnan(grad_norm):
+                print(f"\n⚠️  NaN gradient at step {step}, skipping update")
+                continue
+
+            optimizer.step()
+
+            # Track metrics
+            iter_time = time.time() - iter_start
+            iter_times.append(iter_time)
+            train_losses.append(loss.item())
+
+            # Memory tracking (every 100 steps to reduce overhead)
+            if step % 100 == 0:
+                mem_mb = process.memory_info().rss / 1024 / 1024
+                memory_usage.append(mem_mb)
+
+            # Logging
+            if step % self.log_interval == 0:
+                tokens_per_sec = self.batch_size * self.seq_len / iter_time
+                print(f"Step {step:5d} | Loss: {loss.item():.4f} | LR: {lr:.2e} | "
+                      f"Grad: {grad_norm:.2f} | {tokens_per_sec:.0f} tok/s | {iter_time*1000:.1f}ms/iter")
+
+            # Evaluation
+            if step % self.eval_interval == 0:
+                val_loss = self.evaluate(model)
+                val_losses.append((step, val_loss))
+                val_ppl = math.exp(min(val_loss, 20))  # Cap to prevent overflow
+                print(f"  → Val loss: {val_loss:.4f} | Val perplexity: {val_ppl:.2f}")
+
+        # Final evaluation
+        print("\nFinal evaluation...")
+        final_val_loss = self.evaluate(model, max_batches=200)
+        final_ppl = math.exp(min(final_val_loss, 20))
+
+        # Compute statistics
+        metrics = {
+            'num_params': num_params,
+            'train_losses': train_losses,
+            'val_losses': val_losses,
+            'final_val_loss': final_val_loss,
+            'final_perplexity': final_ppl,
+            'iter_times': iter_times,
+            'mean_iter_time': sum(iter_times) / len(iter_times),
+            'std_iter_time': torch.tensor(iter_times).std().item(),
+            'tokens_per_sec': self.batch_size * self.seq_len / (sum(iter_times) / len(iter_times)),
+            'peak_memory_mb': max(memory_usage) if memory_usage else 0.0,
+            'total_time_sec': sum(iter_times),
+        }
+
+        print(f"\n{'='*60}")
+        print(f"Training complete!")
+        print(f"Final val loss: {final_val_loss:.4f}")
+        print(f"Final perplexity: {final_ppl:.2f}")
+        print(f"Mean iter time: {metrics['mean_iter_time']*1000:.2f} ± {metrics['std_iter_time']*1000:.2f} ms")
+        print(f"Throughput: {metrics['tokens_per_sec']:.0f} tokens/sec")
+        print(f"Peak memory: {metrics['peak_memory_mb']:.1f} MB")
+        print(f"Total time: {metrics['total_time_sec']/60:.1f} minutes")
+        print(f"{'='*60}\n")
+
+        return metrics
+
+    def run_benchmark(self):
+        """
+        Run complete benchmark with multiple seeds.
+
+        Returns:
+            summary: Dict with mean/std across all runs
+        """
+        all_metrics = []
+
+        for run_idx in range(self.num_runs):
+            seed = 42 + run_idx
+            metrics = self.run_training(seed=seed)
+            all_metrics.append(metrics)
+
+        # Aggregate across runs
+        if self.num_runs > 1:
+            summary = {
+                'num_runs': self.num_runs,
+                'mean_final_loss': sum(m['final_val_loss'] for m in all_metrics) / self.num_runs,
+                'std_final_loss': torch.tensor([m['final_val_loss'] for m in all_metrics]).std().item(),
+                'mean_final_ppl': sum(m['final_perplexity'] for m in all_metrics) / self.num_runs,
+                'mean_iter_time': sum(m['mean_iter_time'] for m in all_metrics) / self.num_runs,
+                'std_iter_time': torch.tensor([m['mean_iter_time'] for m in all_metrics]).std().item(),
+                'mean_throughput': sum(m['tokens_per_sec'] for m in all_metrics) / self.num_runs,
+                'mean_peak_memory': sum(m['peak_memory_mb'] for m in all_metrics) / self.num_runs,
+                'all_runs': all_metrics,
+            }
+        else:
+            summary = all_metrics[0]
+            summary['num_runs'] = 1
+
+        return summary
+
+
 class Predictor(nn.Module):
     def __init__(self, latent_size: int, hidden_size: int):
         super().__init__()

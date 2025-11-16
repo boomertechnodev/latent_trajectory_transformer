@@ -294,13 +294,33 @@ class FractalAttention(nn.Module):
             if mask.dim() == 2:
                 # Expand to neighbor dimension
                 mask_expanded = mask.unsqueeze(1).unsqueeze(-1).expand(-1, self.nb_heads, -1, effective_window)
-            else:
-                # Full attention mask - need to gather based on neighbor indices
-                # This is more complex, skip for now
-                pass
+            elif mask.dim() == 3:
+                # Full attention mask (batch_size, seq_len, seq_len)
+                # For each query position i, gather mask values for its neighbor positions
+                # mask: (batch_size, seq_len, seq_len)
+                # neighbor_indices: (seq_len, effective_window)
+                # Result: (batch_size, seq_len, effective_window)
 
-            if mask.dim() == 2:
-                scores = scores.masked_fill(~mask_expanded, float('-inf'))
+                # Expand neighbor_indices for batch dimension
+                # neighbor_indices: (seq_len, effective_window) -> (batch_size, seq_len, effective_window)
+                neighbor_indices_batch = neighbor_indices.unsqueeze(0).expand(batch_size, -1, -1)
+
+                # Gather mask values for neighbors
+                # For each position i, we want mask[:, i, neighbor_indices[i, :]]
+                # Use torch.gather along the last dimension (dimension 2)
+                mask_neighbors = torch.gather(
+                    mask,  # (batch_size, seq_len, seq_len)
+                    dim=2,  # Gather along the key dimension
+                    index=neighbor_indices_batch  # (batch_size, seq_len, effective_window)
+                )  # Result: (batch_size, seq_len, effective_window)
+
+                # Expand for heads dimension
+                mask_expanded = mask_neighbors.unsqueeze(1).expand(-1, self.nb_heads, -1, -1)
+            else:
+                raise ValueError(f"Mask must be 2D or 3D, got {mask.dim()}D")
+
+            # Apply mask by setting masked positions to -inf
+            scores = scores.masked_fill(~mask_expanded, float('-inf'))
 
         # Compute attention weights
         attn_weights = F.softmax(scores, dim=-1)  # (batch_size, nb_heads, seq_len, effective_window)

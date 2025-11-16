@@ -39,6 +39,81 @@ import numpy as np
 
 
 # ══════════════════════════════════════════════════════════════════════════
+#  NUMERICAL STABILITY UTILITIES
+# ══════════════════════════════════════════════════════════════════════════
+
+class NumericalStability:
+    """
+    Numerical stability utilities for fractal attention computations.
+
+    All agents identified 15+ numerical stability issues. This class provides
+    robust implementations to prevent NaN/Inf and ensure stable gradients.
+
+    Key improvements from agent analyses:
+    - Statistical-testing agent: Identified unstable log operations at lines 306, 710
+    - Numerical-stability agent: Recommended eps=1e-6 instead of 1e-8
+    - Normalizing-flows agent: Suggested log-sum-exp trick for stability
+    """
+
+    EPS = 1e-6  # Unified epsilon (was inconsistent 1e-8 in multiple places)
+
+    @staticmethod
+    def stable_log(x: torch.Tensor, eps: float = None) -> torch.Tensor:
+        """
+        Numerically stable logarithm with proper epsilon handling.
+
+        Fixes issues at lines 306, 710: torch.log(local_weights + 1e-8)
+
+        Args:
+            x: Input tensor
+            eps: Epsilon value (default: 1e-6)
+
+        Returns:
+            Stable log(x) without underflow
+        """
+        if eps is None:
+            eps = NumericalStability.EPS
+        return torch.log(torch.clamp(x, min=eps))
+
+    @staticmethod
+    def stable_exp(x: torch.Tensor, max_val: float = 20.0) -> torch.Tensor:
+        """
+        Numerically stable exponential with overflow protection.
+
+        Fixes issues at lines 260, 691: Unbounded exp() can overflow
+
+        Args:
+            x: Input tensor
+            max_val: Maximum value to clamp to (default: 20.0)
+
+        Returns:
+            Stable exp(x) without overflow
+        """
+        return torch.exp(torch.clamp(x, min=-max_val, max=max_val))
+
+    @staticmethod
+    def stable_softmax(x: torch.Tensor, dim: int = -1, temperature: float = 1.0) -> torch.Tensor:
+        """
+        Temperature-scaled stable softmax using log-sum-exp trick.
+
+        Fixes issues at lines 454, 614, 713, 933: Raw softmax can be unstable
+
+        Args:
+            x: Input tensor
+            dim: Dimension to apply softmax
+            temperature: Temperature scaling (clamped to [0.1, 10.0])
+
+        Returns:
+            Stable softmax(x / temperature)
+        """
+        temperature = torch.clamp(torch.tensor(temperature), min=0.1, max=10.0)
+        x_scaled = x / temperature
+        x_max = x_scaled.max(dim=dim, keepdim=True)[0]
+        exp_x = torch.exp(x_scaled - x_max)
+        return exp_x / (exp_x.sum(dim=dim, keepdim=True) + NumericalStability.EPS)
+
+
+# ══════════════════════════════════════════════════════════════════════════
 #  MATHEMATICAL UTILITIES FOR FRACTALS
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -257,7 +332,8 @@ class HilbertCurveAttention(nn.Module):
         local_distances = torch.tensor(local_distances, dtype=torch.float32)
 
         # Compute attention weights based on 2D distance
-        weights = torch.exp(-local_distances * self.distance_scale)
+        # Use stable_exp to prevent overflow from unbounded distance_scale
+        weights = NumericalStability.stable_exp(-local_distances * self.distance_scale)
 
         # Add learnable local bias
         if len(weights) <= len(self.local_bias):
@@ -302,11 +378,11 @@ class HilbertCurveAttention(nn.Module):
             scores = torch.matmul(query[b], local_keys.t())  # (1, num_local)
             scores = scores / math.sqrt(hidden_dim)
 
-            # Apply distance-based weights
-            scores = scores + torch.log(local_weights + 1e-8)
+            # Apply distance-based weights (FIXED: using stable_log from numerical-stability agent)
+            scores = scores + NumericalStability.stable_log(local_weights)
 
-            # Softmax
-            attn_weights = F.softmax(scores, dim=-1)
+            # Softmax (FIXED: using stable_softmax from statistical-testing agent)
+            attn_weights = NumericalStability.stable_softmax(scores, dim=-1)
 
             # Apply attention
             output = torch.matmul(attn_weights, local_values)  # (1, hidden_dim)
@@ -439,8 +515,8 @@ class CantorSetAttention(nn.Module):
             scores = torch.matmul(query, sampled_keys.transpose(-2, -1))
             scores = scores / math.sqrt(hidden_dim)
 
-            # Temperature-scaled softmax
-            attn_weights = F.softmax(scores / self.config.cantor_temperature, dim=-1)
+            # Temperature-scaled stable softmax
+            attn_weights = NumericalStability.stable_softmax(scores, dim=-1, temperature=self.config.cantor_temperature)
 
             # Apply attention
             scale_output = torch.matmul(attn_weights, sampled_values)
@@ -449,9 +525,9 @@ class CantorSetAttention(nn.Module):
         # Blend scales using learned weights
         scale_outputs = torch.stack(scale_outputs, dim=0)  # (num_scales, batch, 1, hidden_dim)
 
-        # Normalize scale weights
+        # Normalize scale weights with stable softmax
         active_weights = self.scale_weights[:len(scale_outputs)]
-        normalized_weights = F.softmax(active_weights / self.scale_temperature, dim=0)
+        normalized_weights = NumericalStability.stable_softmax(active_weights, dim=0, temperature=self.scale_temperature)
         normalized_weights = normalized_weights.view(-1, 1, 1, 1)
 
         # Weighted combination
@@ -540,8 +616,8 @@ class DragonCurveAttention(nn.Module):
                         padding=kernel_size//2
                     ).squeeze()
 
-                # Normalize to [0, 1]
-                pattern = (new_pattern - new_pattern.min()) / (new_pattern.max() - new_pattern.min() + 1e-8)
+                # Normalize to [0, 1] with consistent epsilon
+                pattern = (new_pattern - new_pattern.min()) / (new_pattern.max() - new_pattern.min() + NumericalStability.EPS)
 
             patterns.append(pattern)
 
@@ -581,8 +657,8 @@ class DragonCurveAttention(nn.Module):
                 elif idx >= pattern_len:
                     weights[i] = pattern[-1]
                 else:
-                    # Linear interpolation
-                    alpha = (x - x_old[idx-1]) / (x_old[idx] - x_old[idx-1] + 1e-8)
+                    # Linear interpolation with consistent epsilon
+                    alpha = (x - x_old[idx-1]) / (x_old[idx] - x_old[idx-1] + NumericalStability.EPS)
                     weights[i] = (1 - alpha) * pattern[idx-1] + alpha * pattern[idx]
 
         # Apply learnable scaling and bias
@@ -610,8 +686,8 @@ class DragonCurveAttention(nn.Module):
         scores = torch.matmul(query, weighted_keys.transpose(-2, -1))
         scores = scores / math.sqrt(hidden_dim)
 
-        # Softmax
-        attn_weights = F.softmax(scores, dim=-1)
+        # Stable softmax
+        attn_weights = NumericalStability.stable_softmax(scores, dim=-1)
 
         # Blend with uniform attention based on learned function
         iteration_features = torch.zeros(self.config.dragon_iterations, device=device)
@@ -673,22 +749,48 @@ class JuliaSetAttention(nn.Module):
         # Julia set parameter
         c = torch.complex(self.julia_c_real, self.julia_c_imag)
 
-        # Compute escape times
+        # Compute escape times with soft escape criterion for differentiability
+        # IMPROVED: Replaced hard threshold (break) with soft sigmoid escape
+        # Added bounds checking to prevent complex number explosion
         escape_times = torch.zeros(seq_len)
+        smoothness = 2.0  # Controls steepness of soft escape transition
+        max_magnitude = 10.0  # Prevent explosion (radius * 5)
 
         for i in range(seq_len):
             z_i = z[i]
+            escape_found = torch.tensor(0.0)
+            escape_iteration = torch.tensor(0.0)
+
             for iteration in range(self.config.julia_iterations):
                 z_i = z_i * z_i + c
-                if torch.abs(z_i) > self.config.julia_escape_radius:
-                    escape_times[i] = iteration / self.config.julia_iterations
-                    break
+
+                # Bounds checking: clamp complex number to prevent explosion
+                # This maintains differentiability while preventing NaN
+                z_real = torch.clamp(z_i.real, -max_magnitude, max_magnitude)
+                z_imag = torch.clamp(z_i.imag, -max_magnitude, max_magnitude)
+                z_i = torch.complex(z_real, z_imag)
+
+                magnitude = torch.abs(z_i)
+
+                # Soft escape using sigmoid: smoother than tanh
+                # sigmoid((magnitude - radius) * smoothness) → [0, 1]
+                escape_prob = torch.sigmoid((magnitude - self.config.julia_escape_radius) * smoothness)
+
+                # Weighted average: first strong escape signal determines time
+                # Use (1 - escape_found) to dampen later contributions
+                contribution = escape_prob * torch.clamp(1.0 - escape_found, min=0.0)
+                escape_iteration = escape_iteration + contribution * float(iteration)
+                escape_found = escape_found + contribution
+
+            # Normalize to [0, 1] range with clamping for stability
+            if self.config.julia_iterations > 1:
+                escape_times[i] = torch.clamp(escape_iteration / float(self.config.julia_iterations - 1), 0.0, 1.0)
             else:
-                # Didn't escape - in the Julia set
-                escape_times[i] = 1.0
+                escape_times[i] = 0.5
 
         # Convert escape times to weights
-        weights = torch.exp(escape_times * self.escape_scale)
+        # Use stable_exp to prevent overflow from unbounded escape_scale
+        weights = NumericalStability.stable_exp(escape_times * self.escape_scale)
 
         return weights
 
@@ -706,11 +808,11 @@ class JuliaSetAttention(nn.Module):
         scores = torch.matmul(query, key.transpose(-2, -1))
         scores = scores / math.sqrt(hidden_dim)
 
-        # Modulate with Julia weights
-        scores = scores + torch.log(julia_weights.unsqueeze(0).unsqueeze(0) + 1e-8)
+        # Modulate with Julia weights (FIXED: using stable_log from numerical-stability agent)
+        scores = scores + NumericalStability.stable_log(julia_weights.unsqueeze(0).unsqueeze(0))
 
-        # Softmax
-        attn_weights = F.softmax(scores, dim=-1)
+        # Softmax (FIXED: using stable_softmax from statistical-testing agent)
+        attn_weights = NumericalStability.stable_softmax(scores, dim=-1)
 
         # Apply attention
         output = torch.matmul(attn_weights, value)
@@ -881,10 +983,11 @@ class FractalPosteriorAffine(nn.Module):
             nn.Linear(hidden_size, 2 * latent_size),
         )
 
-        # Initialize network weights
+        # Initialize network weights with conservative gain for gradient stability
+        # IMPROVED: Reduced gain from 0.5 to 0.1 per numerical-stability agent recommendation
         for m in self.net:
             if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight, gain=0.5)  # Smaller gain for stability
+                nn.init.xavier_uniform_(m.weight, gain=0.1)  # Very small gain for stable gradients
                 nn.init.zeros_(m.bias)
 
         # Initialize log std (fixing initialization issue)

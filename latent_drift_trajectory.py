@@ -865,7 +865,7 @@ def train_ode(
             current_ep = initial_ep + interp * (final_ep - initial_ep)
         else:
             current_ep = final_ep
-        weights = (loss_weights[0], current_ep, loss_weights[1])
+        weights = (loss_weights[0], current_ep, loss_weights[2])
 
         model.train()
         loss, loss_dict = model(tokens, loss_weights=weights)

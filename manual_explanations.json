@@ -1,0 +1,304 @@
+{
+  "_schema": {
+    "description": "Manual high-quality explanations for neural code search training",
+    "format": "Each entry maps filepath:line_range to explanation",
+    "guidelines": [
+      "Length: 50-150 characters for decoder training",
+      "Style: Clear, technical, concise",
+      "Focus: What the code DOES and WHY",
+      "Audience: Developers familiar with Python and ML"
+    ]
+  },
+
+  "explanations": [
+    {
+      "id": 1,
+      "file": "./latent_drift_trajectory.py",
+      "line_range": "955-1015",
+      "component": "RaccoonDynamics",
+      "explanation": "Implements stochastic differential equations with drift and diffusion networks for latent trajectory evolution",
+      "category": "core_algorithm",
+      "keywords": ["SDE", "dynamics", "drift", "diffusion", "stochastic"]
+    },
+    {
+      "id": 2,
+      "file": "./latent_drift_trajectory.py",
+      "line_range": "1017-1053",
+      "component": "solve_sde",
+      "explanation": "Euler-Maruyama integration for solving SDEs with proper time broadcasting and noise injection",
+      "category": "core_algorithm",
+      "keywords": ["SDE", "solver", "Euler-Maruyama", "integration", "numerical"]
+    },
+    {
+      "id": 3,
+      "file": "./latent_drift_trajectory.py",
+      "line_range": "1055-1110",
+      "component": "CouplingLayer",
+      "explanation": "Affine coupling transformation for normalizing flows with time-conditioned scale and shift parameters",
+      "category": "core_algorithm",
+      "keywords": ["normalizing flow", "coupling", "invertible", "bijective"]
+    },
+    {
+      "id": 4,
+      "file": "./latent_drift_trajectory.py",
+      "line_range": "1113-1164",
+      "component": "RaccoonFlow",
+      "explanation": "Stack of coupling layers implementing normalizing flow for expressive latent space transformations",
+      "category": "architecture",
+      "keywords": ["normalizing flow", "coupling layers", "density estimation"]
+    },
+    {
+      "id": 5,
+      "file": "./latent_drift_trajectory.py",
+      "line_range": "917-953",
+      "component": "TimeAwareTransform",
+      "explanation": "Multi-scale time embedding using exponentially-spaced frequency bands for rotation-invariant features",
+      "category": "core_algorithm",
+      "keywords": ["time embedding", "sinusoidal", "positional encoding"]
+    },
+    {
+      "id": 6,
+      "file": "./latent_drift_trajectory.py",
+      "line_range": "103-152",
+      "component": "FastEppsPulley",
+      "explanation": "Epps-Pulley characteristic function test for normality using proper quadrature weight calculation",
+      "category": "statistical_testing",
+      "keywords": ["Epps-Pulley", "normality test", "characteristic function"]
+    },
+    {
+      "id": 7,
+      "file": "./01_hilbert_curve_mapper/hilbert_mapper.py",
+      "line_range": "1-100",
+      "component": "HilbertCurveMapper",
+      "explanation": "Maps 1D sequence positions to 2D coordinates along Hilbert curve for locality-preserving fractal attention",
+      "category": "core_algorithm",
+      "keywords": ["Hilbert curve", "fractal", "space-filling curve", "locality"]
+    },
+    {
+      "id": 8,
+      "file": "./latent_drift_trajectory.py",
+      "line_range": "1166-1253",
+      "component": "RaccoonMemory",
+      "explanation": "Priority-based experience replay buffer for continual learning with robust score normalization",
+      "category": "continual_learning",
+      "keywords": ["experience replay", "memory buffer", "priority sampling"]
+    },
+    {
+      "id": 9,
+      "file": "./latent_drift_trajectory.py",
+      "line_range": "325-368",
+      "component": "PriorODE",
+      "explanation": "Shallow neural ODE with 5 layers for modeling continuous-time latent dynamics with stable gradients",
+      "category": "core_algorithm",
+      "keywords": ["ODE", "prior", "dynamics", "continuous-time"]
+    },
+    {
+      "id": 10,
+      "file": "./latent_drift_trajectory.py",
+      "line_range": "370-441",
+      "component": "DiscreteObservation",
+      "explanation": "Causal transformer decoder for autoregressive token prediction conditioned on latent trajectories",
+      "category": "architecture",
+      "keywords": ["decoder", "transformer", "autoregressive", "causal"]
+    },
+    {
+      "id": 11,
+      "file": "./latent_drift_trajectory.py",
+      "line_range": "443-543",
+      "component": "PosteriorEncoder",
+      "explanation": "Bidirectional transformer encoder with 4 blocks for mapping sequences to latent distributions",
+      "category": "architecture",
+      "keywords": ["encoder", "transformer", "bidirectional", "posterior"]
+    },
+    {
+      "id": 12,
+      "file": "./latent_drift_trajectory.py",
+      "line_range": "558-602",
+      "component": "QKVAttention",
+      "explanation": "Multi-head attention with optional causal masking for transformer building blocks",
+      "category": "architecture",
+      "keywords": ["attention", "multi-head", "QKV", "causal mask"]
+    },
+    {
+      "id": 13,
+      "file": "./latent_drift_trajectory.py",
+      "line_range": "650-776",
+      "component": "DeterministicLatentODE",
+      "explanation": "Combines encoder, ODE dynamics, and decoder with three loss terms: reconstruction, normality regularization, and ODE matching",
+      "category": "architecture",
+      "keywords": ["VAE", "ODE", "latent model", "generative"]
+    },
+    {
+      "id": 14,
+      "file": "./latent_drift_trajectory.py",
+      "line_range": "1337-1566",
+      "component": "RaccoonLogClassifier",
+      "explanation": "Continual learning classifier using SDE dynamics, normalizing flows, and experience replay for concept drift",
+      "category": "continual_learning",
+      "keywords": ["continual learning", "classifier", "concept drift", "online adaptation"]
+    },
+    {
+      "id": 15,
+      "file": "./02_cantor_set_sampler/cantor_sampler.py",
+      "line_range": "1-100",
+      "component": "CantorSetSampler",
+      "explanation": "Multi-scale fractal sampling using Cantor set structure for hierarchical attention patterns",
+      "category": "fractal_attention",
+      "keywords": ["Cantor set", "fractal", "hierarchical", "sampling"]
+    },
+    {
+      "id": 16,
+      "file": "./04_dragon_curve_attention/dragon_curve.py",
+      "line_range": "1-150",
+      "component": "DragonCurvePattern",
+      "explanation": "Generates dragon curve fractal patterns for self-similar attention routing in transformers",
+      "category": "fractal_attention",
+      "keywords": ["dragon curve", "fractal", "self-similar", "attention"]
+    },
+    {
+      "id": 17,
+      "file": "./fractal_attention2.py",
+      "line_range": "200-350",
+      "component": "FractalAttentionMechanism",
+      "explanation": "Combines Hilbert, Cantor, Dragon, and Julia set fractals for O(n log n) complexity attention",
+      "category": "fractal_attention",
+      "keywords": ["fractal attention", "complexity reduction", "hybrid fractals"]
+    },
+    {
+      "id": 18,
+      "file": "./latent_drift_trajectory.py",
+      "line_range": "831-905",
+      "component": "train_ode",
+      "explanation": "Training loop for latent ODE model with AdamW optimizer and Epps-Pulley regularization warmup",
+      "category": "training",
+      "keywords": ["training", "optimization", "warmup", "AdamW"]
+    },
+    {
+      "id": 19,
+      "file": "./latent_drift_trajectory.py",
+      "line_range": "1568-1614",
+      "component": "train_raccoon_classifier",
+      "explanation": "Phase 1 supervised training for Raccoon classifier tracking accuracy and multi-component loss",
+      "category": "training",
+      "keywords": ["supervised learning", "training loop", "classification"]
+    },
+    {
+      "id": 20,
+      "file": "./latent_drift_trajectory.py",
+      "line_range": "1617-1665",
+      "component": "continuous_learning_phase",
+      "explanation": "Phase 2 online adaptation with single-sample updates and memory replay to prevent catastrophic forgetting",
+      "category": "continual_learning",
+      "keywords": ["online learning", "continual learning", "memory replay"]
+    },
+    {
+      "id": 21,
+      "file": "./latent_drift_trajectory.py",
+      "line_range": "66-101",
+      "component": "SlicingUnivariateTest",
+      "explanation": "Multivariate statistical testing via random projections for latent space normality validation",
+      "category": "statistical_testing",
+      "keywords": ["statistical testing", "random projections", "multivariate"]
+    },
+    {
+      "id": 22,
+      "file": "./neural_code_search.py",
+      "line_range": "150-217",
+      "component": "_chunk_file",
+      "explanation": "Splits code files into overlapping chunks with metadata extraction for semantic search indexing",
+      "category": "data_processing",
+      "keywords": ["chunking", "sliding window", "preprocessing"]
+    },
+    {
+      "id": 23,
+      "file": "./neural_code_search.py",
+      "line_range": "219-268",
+      "component": "_extract_explanation_target",
+      "explanation": "Multi-tier fallback extraction: docstrings, comments, synthetic descriptions, or code snippets",
+      "category": "data_processing",
+      "keywords": ["explanation extraction", "docstrings", "fallback"]
+    },
+    {
+      "id": 24,
+      "file": "./neural_code_search.py",
+      "line_range": "400-500",
+      "component": "get_embedding",
+      "explanation": "Encodes tokenized chunks through encoder, SDE trajectory, and normalizing flow to latent embeddings",
+      "category": "neural_search",
+      "keywords": ["embedding", "encoder", "SDE", "flow"]
+    },
+    {
+      "id": 25,
+      "file": "./neural_code_search.py",
+      "line_range": "550-650",
+      "component": "train",
+      "explanation": "End-to-end training loop for neural code search: chunk files, train model, generate embeddings, save index",
+      "category": "training",
+      "keywords": ["training", "indexing", "end-to-end"]
+    },
+    {
+      "id": 26,
+      "file": "./neural_code_search.py",
+      "line_range": "700-800",
+      "component": "query",
+      "explanation": "Semantic search via embedding similarity and autoregressive explanation generation from decoder",
+      "category": "neural_search",
+      "keywords": ["query", "search", "retrieval", "explanation"]
+    },
+    {
+      "id": 27,
+      "file": "./01_hilbert_curve_mapper/test_hilbert_mapper.py",
+      "line_range": "78-133",
+      "component": "test_locality_preservation",
+      "explanation": "Validates Hilbert curve keeps consecutive sequence positions close in 2D space for fractal attention",
+      "category": "testing",
+      "keywords": ["testing", "locality", "Hilbert curve", "validation"]
+    },
+    {
+      "id": 28,
+      "file": "./fractal_attention2.py",
+      "line_range": "400-500",
+      "component": "JuliaSetAttention",
+      "explanation": "Uses Julia set fractal patterns to create dynamic attention masks with complex number iteration",
+      "category": "fractal_attention",
+      "keywords": ["Julia set", "fractal", "complex dynamics", "attention mask"]
+    },
+    {
+      "id": 29,
+      "file": "./latent_drift_trajectory.py",
+      "line_range": "290-323",
+      "component": "solve_ode",
+      "explanation": "Simple Euler integration for ordinary differential equations with configurable step size",
+      "category": "numerical_methods",
+      "keywords": ["ODE", "Euler method", "integration", "numerical"]
+    },
+    {
+      "id": 30,
+      "file": "./latent_drift_trajectory.py",
+      "line_range": "778-829",
+      "component": "sample_sequences_ode",
+      "explanation": "Generates sequences by sampling latent initial conditions, rolling out ODE, and autoregressively decoding",
+      "category": "generation",
+      "keywords": ["sampling", "generation", "ODE", "autoregressive"]
+    }
+  ],
+
+  "statistics": {
+    "total_manual_explanations": 30,
+    "categories": {
+      "core_algorithm": 6,
+      "architecture": 5,
+      "continual_learning": 4,
+      "fractal_attention": 5,
+      "training": 3,
+      "statistical_testing": 2,
+      "data_processing": 2,
+      "neural_search": 2,
+      "testing": 1,
+      "numerical_methods": 1,
+      "generation": 1
+    },
+    "avg_explanation_length": "~100 characters",
+    "coverage": "30 key components across 8 files"
+  }
+}

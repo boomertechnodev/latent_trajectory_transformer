@@ -49,6 +49,9 @@ import argparse
 from tqdm import tqdm
 import json
 
+# Global cache for manual explanations
+_MANUAL_EXPLANATIONS = None
+
 # Import from existing implementation
 from latent_drift_trajectory import (
     RaccoonDynamics,
@@ -198,7 +201,10 @@ class UniversalTokenizer:
             chunk_text = content[start_char:end_char]
 
             # Try to extract explanation target from context
-            explanation = self._extract_explanation_target(chunk_text, metadata, ext)
+            # Priority: manual explanations > automated extraction
+            explanation = self._get_manual_explanation(filepath, chunk_text)
+            if explanation is None:
+                explanation = self._extract_explanation_target(chunk_text, metadata, ext, filepath)
 
             chunk_dict = {
                 'tokens': torch.tensor(chunk_tokens, dtype=torch.long),
@@ -216,8 +222,72 @@ class UniversalTokenizer:
 
         return chunks
 
-    def _extract_explanation_target(self, text: str, metadata: Dict, ext: str) -> Optional[str]:
-        """Extract ground-truth explanation from docstrings, comments, etc."""
+    def _load_manual_explanations(self) -> Dict:
+        """Load manual explanations from JSON file."""
+        global _MANUAL_EXPLANATIONS
+        if _MANUAL_EXPLANATIONS is not None:
+            return _MANUAL_EXPLANATIONS
+
+        manual_file = os.path.join(os.path.dirname(__file__), 'manual_explanations.json')
+        if os.path.exists(manual_file):
+            try:
+                with open(manual_file, 'r') as f:
+                    data = json.load(f)
+                    # Build lookup dict: filepath -> list of explanations
+                    lookup = {}
+                    for item in data.get('explanations', []):
+                        filepath = item['file']
+                        if filepath not in lookup:
+                            lookup[filepath] = []
+                        lookup[filepath].append(item)
+                    _MANUAL_EXPLANATIONS = lookup
+                    print(f"✓ Loaded {len(data.get('explanations', []))} manual explanations")
+                    return lookup
+            except Exception as e:
+                print(f"⚠ Failed to load manual explanations: {e}")
+                _MANUAL_EXPLANATIONS = {}
+                return {}
+        else:
+            _MANUAL_EXPLANATIONS = {}
+            return {}
+
+    def _get_manual_explanation(self, filepath: str, chunk_text: str) -> Optional[str]:
+        """Check if there's a manual explanation for this chunk."""
+        manual_exps = self._load_manual_explanations()
+
+        # Normalize filepath
+        norm_path = os.path.normpath(filepath)
+
+        # Try exact match first
+        if norm_path in manual_exps:
+            # Check if chunk text matches any manual explanation's component
+            for item in manual_exps[norm_path]:
+                component = item.get('component', '')
+                # If chunk contains the component name, use this explanation
+                if component and component in chunk_text:
+                    return item['explanation']
+
+        # Try without leading ./
+        if norm_path.startswith('./'):
+            alt_path = norm_path[2:]
+            if alt_path in manual_exps:
+                for item in manual_exps[alt_path]:
+                    component = item.get('component', '')
+                    if component and component in chunk_text:
+                        return item['explanation']
+
+        return None
+
+    def _extract_explanation_target(self, text: str, metadata: Dict, ext: str, filepath: str = '') -> Optional[str]:
+        """
+        Extract ground-truth explanation from docstrings, comments, etc.
+
+        Fallback hierarchy:
+        1. Docstrings (natural language)
+        2. Inline comments
+        3. Synthetic descriptions from code structure
+        4. First 30 tokens of code
+        """
         if ext == '.py':
             # Check if this chunk has a docstring
             docstring_match = re.search(r'"""(.+?)"""', text, re.DOTALL)
@@ -657,6 +727,7 @@ def build_search_index(repo_path: str, output_path: str, config: Dict):
                     'filepath': c['filepath'],
                     'text': c['text'],
                     'chunk_id': c['chunk_id'],
+                    'explanation_target': c.get('explanation_target', None),  # CRITICAL FIX: Include explanation
                 })
 
     all_embeddings = torch.cat(embeddings_list, dim=0)

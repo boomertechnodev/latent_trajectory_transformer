@@ -3,17 +3,24 @@
 Latent Code Search - Search your codebase using trajectory planning in latent space.
 
 This is a practical application of the latent trajectory transformer that:
-1. Tokenizes code at the character level
-2. Learns latent trajectory representations incrementally (continual learning)
-3. Finds relevant code chunks using trajectory similarity
-4. Runs efficiently on CPU (single-core)
+1. Indexes ALL file types: .py, .md, .txt, .yaml, .json, .rs, .cpp, .js, etc.
+2. Extracts intelligent metadata: functions/classes (code), headers (markdown), keys (config)
+3. Uses paragraph-aware chunking for markdown, respecting document structure
+4. Learns latent trajectory representations incrementally (continual learning)
+5. Finds relevant content using trajectory similarity
+6. Returns results with intelligent EXPLANATIONS of why they match
+7. Runs efficiently on CPU (single-core)
 
 Usage:
-    # Index a repository
-    python code_search.py index /path/to/repo --output repo.index
+    # Index entire repository (all supported file types)
+    python code_search.py index . --output repo.index
 
-    # Search
+    # Index specific file types
+    python code_search.py index . --extensions ".py,.md,.txt" --output repo.index
+
+    # Search with intelligent explanations
     python code_search.py query "where is the SDE dynamics?" --index repo.index
+    python code_search.py query "explain continual learning" --index repo.index
 """
 
 import torch
@@ -87,22 +94,43 @@ class CodeChunk:
 
 
 class CodebaseCrawler:
-    """Crawls a repository and extracts code chunks."""
+    """Crawls a repository and extracts code chunks.
+
+    Supports multiple file types with intelligent metadata extraction and chunking:
+    - Code files (.py, .js, .rs, .cpp, .java, etc.): Extract functions/classes, fixed-window chunking
+    - Markdown files (.md): Extract headers, paragraph-aware chunking
+    - Config files (.yaml, .json, .toml, .txt): Extract keys, structure-aware chunking
+    """
+
+    # Supported file extensions by category
+    CODE_EXTENSIONS = {'.py', '.js', '.ts', '.rs', '.cpp', '.c', '.h', '.hpp', '.java', '.go', '.rb', '.php', '.sh'}
+    MARKDOWN_EXTENSIONS = {'.md', '.markdown'}
+    CONFIG_EXTENSIONS = {'.yaml', '.yml', '.json', '.toml', '.txt', '.ini', '.cfg', '.conf'}
 
     def __init__(self, tokenizer: CodeTokenizer, window: int = 512, stride: int = 256):
         self.tokenizer = tokenizer
         self.window = window
         self.stride = stride
 
-    def extract_metadata(self, code: str) -> Dict:
-        """Extract metadata from code using simple regex patterns.
+    def get_file_type(self, file_path: Path) -> str:
+        """Determine file type category from extension."""
+        ext = file_path.suffix.lower()
+        if ext in self.CODE_EXTENSIONS:
+            return 'code'
+        elif ext in self.MARKDOWN_EXTENSIONS:
+            return 'markdown'
+        elif ext in self.CONFIG_EXTENSIONS:
+            return 'config'
+        else:
+            return 'text'  # Fallback
 
-        This is a simple implementation - could be enhanced with AST parsing.
-        """
+    def extract_metadata_python(self, code: str) -> Dict:
+        """Extract metadata from Python code."""
         metadata = {
             'functions': [],
             'classes': [],
             'imports': [],
+            'type': 'python',
         }
 
         # Find function definitions
@@ -119,47 +147,240 @@ class CodebaseCrawler:
 
         return metadata
 
-    def crawl(self, repo_path: Path, pattern: str = "*.py") -> Iterator[CodeChunk]:
-        """Crawl repository and yield code chunks."""
+    def extract_metadata_markdown(self, text: str) -> Dict:
+        """Extract metadata from Markdown files."""
+        metadata = {
+            'headers': [],
+            'code_blocks': [],
+            'lists': [],
+            'type': 'markdown',
+        }
+
+        # Extract headers (# Header, ## Subheader, etc.)
+        header_pattern = r'^(#{1,6})\s+(.+)$'
+        for match in re.finditer(header_pattern, text, re.MULTILINE):
+            level = len(match.group(1))
+            title = match.group(2).strip()
+            metadata['headers'].append((level, title))
+
+        # Extract code block languages
+        code_block_pattern = r'```(\w+)?'
+        metadata['code_blocks'] = re.findall(code_block_pattern, text)
+
+        # Count list items (rough estimate of structure)
+        list_pattern = r'^\s*[-*+]\s+'
+        metadata['lists'] = len(re.findall(list_pattern, text, re.MULTILINE))
+
+        return metadata
+
+    def extract_metadata_config(self, text: str, file_ext: str) -> Dict:
+        """Extract metadata from config files."""
+        metadata = {
+            'keys': [],
+            'sections': [],
+            'type': 'config',
+            'format': file_ext.lstrip('.'),
+        }
+
+        if file_ext in {'.yaml', '.yml'}:
+            # YAML top-level keys
+            key_pattern = r'^(\w+):\s*'
+            metadata['keys'] = re.findall(key_pattern, text, re.MULTILINE)
+        elif file_ext == '.json':
+            # JSON top-level keys (rough approximation)
+            key_pattern = r'^\s*"(\w+)"\s*:'
+            metadata['keys'] = re.findall(key_pattern, text, re.MULTILINE)
+        elif file_ext == '.toml':
+            # TOML sections and keys
+            section_pattern = r'^\[(.+)\]$'
+            metadata['sections'] = re.findall(section_pattern, text, re.MULTILINE)
+            key_pattern = r'^(\w+)\s*='
+            metadata['keys'] = re.findall(key_pattern, text, re.MULTILINE)
+        else:
+            # Generic text - extract common key-value patterns
+            key_pattern = r'^(\w+)\s*[=:]'
+            metadata['keys'] = re.findall(key_pattern, text, re.MULTILINE)
+
+        return metadata
+
+    def extract_metadata_code(self, code: str, file_ext: str) -> Dict:
+        """Extract metadata from generic code files (JS, Rust, C++, etc.)."""
+        metadata = {
+            'functions': [],
+            'classes': [],
+            'imports': [],
+            'type': 'code',
+            'language': file_ext.lstrip('.'),
+        }
+
+        # Generic function pattern (works for JS, C++, Rust, etc.)
+        # Matches: function foo(), fn foo(), void foo(), etc.
+        func_pattern = r'(?:function|fn|def|void|int|bool|async|pub\s+fn)\s+(\w+)\s*\('
+        metadata['functions'] = re.findall(func_pattern, code)
+
+        # Generic class/struct pattern
+        class_pattern = r'(?:class|struct|interface|trait|impl)\s+(\w+)'
+        metadata['classes'] = re.findall(class_pattern, code)
+
+        # Generic import pattern
+        import_pattern = r'(?:import|require|use|#include)\s+[\'"]?([^\'";\n]+)'
+        metadata['imports'] = re.findall(import_pattern, code)
+
+        return metadata
+
+    def extract_metadata(self, text: str, file_type: str, file_ext: str) -> Dict:
+        """Extract metadata based on file type."""
+        if file_type == 'code':
+            if file_ext == '.py':
+                return self.extract_metadata_python(text)
+            else:
+                return self.extract_metadata_code(text, file_ext)
+        elif file_type == 'markdown':
+            return self.extract_metadata_markdown(text)
+        elif file_type == 'config':
+            return self.extract_metadata_config(text, file_ext)
+        else:
+            return {'type': 'text'}
+
+    def chunk_markdown(self, text: str, tokens: List[int]) -> Iterator[Tuple[List[int], Dict]]:
+        """Chunk markdown by paragraphs and sections, respecting document structure.
+
+        Returns: Iterator of (chunk_tokens, chunk_info) where chunk_info contains
+                line offsets for proper line number calculation.
+        """
+        lines = text.split('\n')
+        paragraphs = []
+        current_para = []
+        current_line = 0
+
+        for line in lines:
+            if line.strip() == '':
+                if current_para:
+                    paragraphs.append({
+                        'lines': current_para,
+                        'start_line': current_line - len(current_para),
+                        'text': '\n'.join(current_para)
+                    })
+                    current_para = []
+            else:
+                current_para.append(line)
+            current_line += 1
+
+        # Add last paragraph
+        if current_para:
+            paragraphs.append({
+                'lines': current_para,
+                'start_line': current_line - len(current_para),
+                'text': '\n'.join(current_para)
+            })
+
+        # Chunk paragraphs, combining small ones
+        for para in paragraphs:
+            para_tokens = self.tokenizer.encode(para['text'])
+
+            if len(para_tokens) <= self.window:
+                # Small paragraph - pad and yield
+                chunk_tokens = self.tokenizer.pad_or_truncate(para_tokens, self.window)
+                yield chunk_tokens, {
+                    'start_line': para['start_line'],
+                    'end_line': para['start_line'] + len(para['lines'])
+                }
+            else:
+                # Large paragraph - use sliding window
+                for i in range(0, len(para_tokens), self.stride):
+                    chunk = para_tokens[i:i + self.window]
+                    chunk = self.tokenizer.pad_or_truncate(chunk, self.window)
+
+                    # Estimate line numbers for this chunk
+                    char_ratio = i / len(para_tokens)
+                    start_offset = int(char_ratio * len(para['lines']))
+                    yield chunk, {
+                        'start_line': para['start_line'] + start_offset,
+                        'end_line': para['start_line'] + min(start_offset + 10, len(para['lines']))
+                    }
+
+    def crawl(self, repo_path: Path, extensions: Optional[List[str]] = None) -> Iterator[CodeChunk]:
+        """Crawl repository and yield code chunks.
+
+        Args:
+            repo_path: Path to repository root
+            extensions: List of file extensions to include (e.g., ['.py', '.md', '.txt'])
+                       If None, includes all supported extensions
+        """
         repo_path = Path(repo_path)
 
-        for file_path in repo_path.rglob(pattern):
+        # Default to all supported extensions
+        if extensions is None:
+            extensions = list(self.CODE_EXTENSIONS | self.MARKDOWN_EXTENSIONS | self.CONFIG_EXTENSIONS)
+
+        # Convert to set for fast lookup
+        extensions_set = {ext.lower() if ext.startswith('.') else f'.{ext.lower()}' for ext in extensions}
+
+        # Iterate over all files
+        for file_path in repo_path.rglob('*'):
+            if not file_path.is_file():
+                continue
+
+            # Check extension
+            if file_path.suffix.lower() not in extensions_set:
+                continue
+
+            # Read file
             try:
-                code = file_path.read_text(encoding='utf-8')
+                text = file_path.read_text(encoding='utf-8')
             except (UnicodeDecodeError, PermissionError):
                 continue
 
+            # Skip empty files
+            if not text.strip():
+                continue
+
+            # Determine file type
+            file_type = self.get_file_type(file_path)
+            file_ext = file_path.suffix.lower()
+
             # Extract metadata
-            metadata = self.extract_metadata(code)
+            metadata = self.extract_metadata(text, file_type, file_ext)
 
             # Tokenize
-            tokens = self.tokenizer.encode(code)
+            tokens = self.tokenizer.encode(text)
 
-            # Calculate lines per character (for line number mapping)
-            lines = code.split('\n')
-            chars_per_line = [len(line) + 1 for line in lines]  # +1 for newline
-            cumulative_chars = [sum(chars_per_line[:i+1]) for i in range(len(chars_per_line))]
+            # Chunk based on file type
+            if file_type == 'markdown':
+                # Use paragraph-aware chunking for markdown
+                for chunk_tokens, chunk_info in self.chunk_markdown(text, tokens):
+                    yield CodeChunk(
+                        tokens=chunk_tokens,
+                        file_path=file_path,
+                        start_line=chunk_info['start_line'] + 1,  # 1-indexed
+                        end_line=chunk_info['end_line'] + 1,
+                        metadata=metadata,
+                    )
+            else:
+                # Use fixed-window chunking for code and config files
+                lines = text.split('\n')
+                chars_per_line = [len(line) + 1 for line in lines]  # +1 for newline
+                cumulative_chars = [sum(chars_per_line[:i+1]) for i in range(len(chars_per_line))]
 
-            # Chunk
-            chunk_idx = 0
-            for chunk_tokens in self.tokenizer.chunk(tokens, self.window, self.stride):
-                # Calculate line numbers for this chunk
-                start_char = chunk_idx * self.stride
-                end_char = start_char + len(chunk_tokens)
+                chunk_idx = 0
+                for chunk_tokens in self.tokenizer.chunk(tokens, self.window, self.stride):
+                    # Calculate line numbers for this chunk
+                    start_char = chunk_idx * self.stride
+                    end_char = start_char + len(chunk_tokens)
 
-                # Find corresponding lines
-                start_line = next((i for i, c in enumerate(cumulative_chars) if c > start_char), 0)
-                end_line = next((i for i, c in enumerate(cumulative_chars) if c >= end_char), len(lines))
+                    # Find corresponding lines
+                    start_line = next((i for i, c in enumerate(cumulative_chars) if c > start_char), 0)
+                    end_line = next((i for i, c in enumerate(cumulative_chars) if c >= end_char), len(lines))
 
-                yield CodeChunk(
-                    tokens=chunk_tokens,
-                    file_path=file_path,
-                    start_line=start_line + 1,  # 1-indexed
-                    end_line=end_line + 1,
-                    metadata=metadata,
-                )
+                    yield CodeChunk(
+                        tokens=chunk_tokens,
+                        file_path=file_path,
+                        start_line=start_line + 1,  # 1-indexed
+                        end_line=end_line + 1,
+                        metadata=metadata,
+                    )
 
-                chunk_idx += 1
+                    chunk_idx += 1
 
 
 # ============================================================================
@@ -532,8 +753,105 @@ def search(
     return results
 
 
-def display_results(results: List[Tuple[CodeChunk, float]], tokenizer: CodeTokenizer):
-    """Display search results in a nice format."""
+def generate_explanation(chunk: CodeChunk, query: str, score: float) -> str:
+    """Generate intelligent explanation for why this chunk matches the query.
+
+    Uses template-based approach with metadata to create human-readable explanations.
+    """
+    file_name = chunk.file_path.name
+    file_type = chunk.metadata.get('type', 'unknown')
+    explanations = []
+
+    # Analyze query for keywords
+    query_lower = query.lower()
+    query_words = set(re.findall(r'\w+', query_lower))
+
+    # Explanation based on file type
+    if file_type == 'python' or file_type == 'code':
+        language = chunk.metadata.get('language', 'Python')
+
+        # Check for function/class matches
+        functions = chunk.metadata.get('functions', [])
+        classes = chunk.metadata.get('classes', [])
+        imports = chunk.metadata.get('imports', [])
+
+        if functions:
+            func_matches = [f for f in functions if any(word in f.lower() for word in query_words)]
+            if func_matches:
+                explanations.append(f"contains function(s) `{', '.join(func_matches[:2])}` matching query terms")
+            elif functions:
+                explanations.append(f"defines {len(functions)} function(s) including `{functions[0]}`")
+
+        if classes:
+            class_matches = [c for c in classes if any(word in c.lower() for word in query_words)]
+            if class_matches:
+                explanations.append(f"defines class `{class_matches[0]}` matching query")
+            elif classes:
+                explanations.append(f"implements class `{classes[0]}`")
+
+        if imports:
+            explanations.append(f"imports {len(imports)} module(s)")
+
+        if not explanations:
+            explanations.append(f"{language} code implementation")
+
+    elif file_type == 'markdown':
+        headers = chunk.metadata.get('headers', [])
+        code_blocks = chunk.metadata.get('code_blocks', [])
+
+        if headers:
+            # Find headers matching query
+            header_matches = [(lvl, title) for lvl, title in headers if any(word in title.lower() for word in query_words)]
+            if header_matches:
+                _, title = header_matches[0]
+                explanations.append(f"section titled '{title}' matching query")
+            else:
+                _, title = headers[0]
+                explanations.append(f"documentation section '{title}'")
+
+        if code_blocks:
+            explanations.append(f"includes {len(code_blocks)} code example(s)")
+
+        if not explanations:
+            explanations.append("documentation content")
+
+    elif file_type == 'config':
+        config_format = chunk.metadata.get('format', 'config')
+        keys = chunk.metadata.get('keys', [])
+        sections = chunk.metadata.get('sections', [])
+
+        if keys:
+            key_matches = [k for k in keys if any(word in k.lower() for word in query_words)]
+            if key_matches:
+                explanations.append(f"{config_format} with key `{key_matches[0]}` matching query")
+            else:
+                explanations.append(f"{config_format} configuration with {len(keys)} keys")
+
+        if sections:
+            explanations.append(f"defines section(s): {', '.join(sections[:2])}")
+
+        if not explanations:
+            explanations.append(f"{config_format} configuration file")
+
+    else:
+        explanations.append("text content")
+
+    # Build final explanation
+    explanation_text = " and ".join(explanations)
+
+    # Add relevance context
+    if score > 0.8:
+        relevance = "highly relevant"
+    elif score > 0.6:
+        relevance = "relevant"
+    else:
+        relevance = "potentially relevant"
+
+    return f"Found in **{file_name}** lines {chunk.start_line}-{chunk.end_line}: {explanation_text}. This is {relevance} to your query (similarity: {score:.2f})."
+
+
+def display_results(results: List[Tuple[CodeChunk, float]], tokenizer: CodeTokenizer, query: str = ""):
+    """Display search results with intelligent explanations."""
     print("\n" + "="*70)
     print(f"Found {len(results)} results:")
     print("="*70)
@@ -544,17 +862,26 @@ def display_results(results: List[Tuple[CodeChunk, float]], tokenizer: CodeToken
         preview_lines = preview.split('\n')[:10]  # First 10 lines
         preview_text = '\n    '.join(preview_lines)
 
-        # Show metadata if available
-        metadata_str = ""
-        if chunk.metadata['functions']:
-            metadata_str += f"  Functions: {', '.join(chunk.metadata['functions'][:3])}\n"
-        if chunk.metadata['classes']:
-            metadata_str += f"  Classes: {', '.join(chunk.metadata['classes'][:3])}\n"
+        # Generate intelligent explanation
+        explanation = generate_explanation(chunk, query, score)
 
-        print(f"\n[{i}] {chunk.file_path}:{chunk.start_line}-{chunk.end_line} (score: {score:.3f})")
-        if metadata_str:
-            print(metadata_str)
-        print(f"    {preview_text}")
+        # Show metadata summary
+        metadata_items = []
+        if 'functions' in chunk.metadata and chunk.metadata['functions']:
+            metadata_items.append(f"Functions: {', '.join(chunk.metadata['functions'][:3])}")
+        if 'classes' in chunk.metadata and chunk.metadata['classes']:
+            metadata_items.append(f"Classes: {', '.join(chunk.metadata['classes'][:3])}")
+        if 'headers' in chunk.metadata and chunk.metadata['headers']:
+            headers_str = ', '.join(f"{'#'*(lvl)} {title}" for lvl, title in chunk.metadata['headers'][:2])
+            metadata_items.append(f"Headers: {headers_str}")
+        if 'keys' in chunk.metadata and chunk.metadata['keys']:
+            metadata_items.append(f"Keys: {', '.join(chunk.metadata['keys'][:5])}")
+
+        print(f"\n[{i}] {chunk.file_path}:{chunk.start_line}-{chunk.end_line}")
+        print(f"    📖 {explanation}")
+        if metadata_items:
+            print(f"    🔍 {' | '.join(metadata_items)}")
+        print(f"\n    Preview:\n    {preview_text}")
         print("─" * 70)
 
 
@@ -582,15 +909,30 @@ def cmd_index(args):
     )
     print(f"✓ Model created ({sum(p.numel() for p in model.parameters()):,} parameters)")
 
+    # Parse extensions
+    if args.extensions:
+        extensions = [ext.strip() for ext in args.extensions.split(',')]
+        print(f"✓ Indexing file types: {', '.join(extensions)}")
+    else:
+        extensions = None  # Use all supported extensions
+        print(f"✓ Indexing all supported file types (.py, .md, .txt, .yaml, .json, etc.)")
+
     # Crawl repository
     crawler = CodebaseCrawler(tokenizer, window=args.seq_len, stride=args.seq_len // 2)
     print(f"✓ Crawling {args.repo_path}...")
-    chunks = list(crawler.crawl(Path(args.repo_path), pattern=args.pattern))
+    chunks = list(crawler.crawl(Path(args.repo_path), extensions=extensions))
     print(f"✓ Found {len(chunks)} code chunks")
 
     if len(chunks) == 0:
-        print("❌ No code chunks found. Check the repository path and pattern.")
+        print("❌ No code chunks found. Check the repository path and extensions.")
         return
+
+    # Show file type breakdown
+    file_types = {}
+    for chunk in chunks:
+        ftype = chunk.metadata.get('type', 'unknown')
+        file_types[ftype] = file_types.get(ftype, 0) + 1
+    print(f"   File type breakdown: {', '.join(f'{k}={v}' for k, v in file_types.items())}")
 
     # Build index
     index = CodeIndex(model, tokenizer)
@@ -620,8 +962,8 @@ def cmd_query(args):
     print(f"\nQuery: \"{args.query}\"")
     results = search(args.query, index, tokenizer, top_k=args.top_k, device=device)
 
-    # Display
-    display_results(results, tokenizer)
+    # Display with intelligent explanations
+    display_results(results, tokenizer, query=args.query)
 
 
 def main():
@@ -632,7 +974,8 @@ def main():
     index_parser = subparsers.add_parser('index', help='Index a repository')
     index_parser.add_argument('repo_path', type=str, help='Path to repository to index')
     index_parser.add_argument('--output', '-o', type=str, default='code.index', help='Output index file')
-    index_parser.add_argument('--pattern', type=str, default='*.py', help='File pattern to match')
+    index_parser.add_argument('--extensions', '-e', type=str, default=None,
+                              help='Comma-separated file extensions (e.g., ".py,.md,.txt"). Default: all supported types')
     index_parser.add_argument('--seq-len', type=int, default=512, help='Sequence length for chunks')
     index_parser.add_argument('--latent-dim', type=int, default=32, help='Latent dimension')
     index_parser.add_argument('--hidden-dim', type=int, default=64, help='Hidden dimension')

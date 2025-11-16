@@ -117,15 +117,21 @@ class FastEppsPulley(UnivariateTest):
         t = torch.linspace(0, t_max, n_points, dtype=torch.float32)  # positive half, incl 0
         dt = t_max / (n_points - 1)
 
-        weights = torch.full((n_points,), 2 * dt, dtype=torch.float32)
-        weights[0] = dt
-        weights[-1] = dt
+        # FIXED: Separate quadrature weights from weight function
+        # Trapezoid quadrature weights (NOT multiplied by phi)
+        quad_weights = torch.full((n_points,), 2 * dt, dtype=torch.float32)
+        quad_weights[0] = dt
+        quad_weights[-1] = dt
+
+        # Weight function (uniform for standard EP test)
+        w = torch.ones_like(t)
 
         phi = (-0.5 * t.square()).exp()
 
         self.register_buffer("t", t)
         self.register_buffer("phi", phi)
-        self.register_buffer("weights", weights * self.phi)
+        # FIXED: Correctly combine quadrature and weight function
+        self.register_buffer("weights", quad_weights * w)
 
     def forward(self, x: Tensor) -> Tensor:
         # x: (*, N, K)
@@ -341,21 +347,31 @@ class PriorInitDistribution(nn.Module):
 
 
 class PriorODE(ODE):
-    def __init__(self, latent_size: int, hidden_size: int):
+    """
+    IMPROVED: Shallower network (5 layers instead of 11) with better initialization
+    for improved gradient flow and numerical stability.
+    """
+    def __init__(self, latent_size: int, hidden_size: int, depth: int = 5):
         super().__init__()
 
         layers = []
         input_dim = latent_size + 1
-        for i in range(11):
+        # FIXED: Use depth=5 instead of 11 for better gradient flow
+        for i in range(depth):
             linear = nn.Linear(input_dim, hidden_size)
-            nn.init.xavier_uniform_(linear.weight)
+            # FIXED: Smaller initialization gain for deep networks
+            nn.init.xavier_uniform_(linear.weight, gain=0.1)
             nn.init.zeros_(linear.bias)
             layers.append(linear)
             layers.append(nn.LayerNorm(hidden_size))
             layers.append(nn.SiLU())
             input_dim = hidden_size
+
+        # FIXED: Add normalization before final layer
+        layers.append(nn.LayerNorm(hidden_size))
         final_linear = nn.Linear(hidden_size, latent_size)
-        nn.init.xavier_uniform_(final_linear.weight)
+        # FIXED: Use orthogonal init for output layer
+        nn.init.orthogonal_(final_linear.weight)
         nn.init.zeros_(final_linear.bias)
         layers.append(final_linear)
         self.drift_net = nn.Sequential(*layers)
@@ -744,7 +760,7 @@ class DeterministicLatentODE(nn.Module):
         ode_reg_loss, z_pred = self.ode_matching_loss(z)
 
         z_for_test = z_pred.reshape(1, -1, latent_size)  # (1, N, D)
-        latent_stat = self.latent_test(z_pred)
+        latent_stat = self.latent_test(z_for_test)  # FIXED: Use reshaped tensor
         latent_reg = latent_stat.mean() + latent_reg
 
         p_x = self.p_observe(torch.cat([z[:, :1, :], z_pred], dim=1), tokens)
@@ -959,9 +975,11 @@ class RaccoonDynamics(nn.Module):
     Implements: dz = drift(z,t)*dt + diffusion(z,t)*dW
     where dW is Wiener process (Brownian motion)
     """
-    def __init__(self, latent_dim: int, hidden_dim: int, sigma: float = 0.1):
+    def __init__(self, latent_dim: int, hidden_dim: int,
+                 sigma_min: float = 1e-4, sigma_max: float = 1.0):
         super().__init__()
-        self.sigma = sigma
+        self.sigma_min = sigma_min
+        self.sigma_max = sigma_max
 
         # Drift network (deterministic component)
         self.drift_net = nn.Sequential(
@@ -972,15 +990,15 @@ class RaccoonDynamics(nn.Module):
             nn.Linear(hidden_dim, latent_dim)
         )
 
-        # Diffusion network (stochastic component)
-        self.diffusion_net = nn.Sequential(
+        # FIXED: Diffusion network outputs log-variance for better numerical stability
+        self.log_diffusion_net = nn.Sequential(
             nn.Linear(latent_dim + 1, hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, latent_dim)
         )
 
         # Initialize small to start near identity
-        for module in [self.drift_net, self.diffusion_net]:
+        for module in [self.drift_net, self.log_diffusion_net]:
             for layer in module:
                 if isinstance(layer, nn.Linear):
                     nn.init.xavier_normal_(layer.weight, gain=0.1)
@@ -1000,7 +1018,14 @@ class RaccoonDynamics(nn.Module):
         zt = torch.cat([z, t], dim=-1)
 
         drift = self.drift_net(zt)
-        diffusion = torch.sigmoid(self.diffusion_net(zt)) * self.sigma
+
+        # FIXED: Compute diffusion with proper bounds for numerical stability
+        log_diffusion = self.log_diffusion_net(zt)
+        # Clip log-diffusion to ensure numerical stability
+        log_diffusion = torch.clamp(log_diffusion,
+                                     math.log(self.sigma_min),
+                                     math.log(self.sigma_max))
+        diffusion = torch.exp(log_diffusion)
 
         return drift, diffusion
 
@@ -1028,7 +1053,8 @@ def solve_sde(
 
     for i in range(len(t_span) - 1):
         dt = t_span[i+1] - t_span[i]
-        t_curr = t_span[i].unsqueeze(0).expand(batch_size, 1)
+        # FIXED: Correct tensor broadcasting from 0-d scalar
+        t_curr = t_span[i:i+1].expand(batch_size, 1)
 
         # Get drift and diffusion
         drift, diffusion = dynamics(z, t_curr)
@@ -1046,14 +1072,19 @@ class CouplingLayer(nn.Module):
     """
     Affine coupling layer for normalizing flows.
     Splits dimensions, uses one half to transform the other.
+
+    IMPROVED: Parameterized time_dim and scale_range for better flexibility.
     """
-    def __init__(self, dim: int, hidden: int, mask: Tensor):
+    def __init__(self, dim: int, hidden: int, mask: Tensor,
+                 time_dim: int = 32, scale_range: float = 3.0):
         super().__init__()
         self.register_buffer('mask', mask)
+        self.time_dim = time_dim
+        self.scale_range = scale_range
 
-        # Network to compute scale and shift parameters
+        # FIXED: Network with parameterized time_dim (not hardcoded 32)
         self.transform_net = nn.Sequential(
-            nn.Linear(dim + 32, hidden),  # +32 for time features
+            nn.Linear(dim + time_dim, hidden),
             nn.SiLU(),
             nn.Linear(hidden, hidden),
             nn.SiLU(),
@@ -1081,8 +1112,8 @@ class CouplingLayer(nn.Module):
         params = self.transform_net(h)
         scale, shift = params.chunk(2, dim=-1)
 
-        # Bound scale for stability
-        scale = torch.tanh(scale / 2) * 2  # Range [-2, 2]
+        # FIXED: Configurable scale bounds for more expressiveness
+        scale = torch.tanh(scale / self.scale_range) * self.scale_range
 
         # Apply transformation only to non-masked dimensions
         if not reverse:
@@ -1099,18 +1130,21 @@ class RaccoonFlow(nn.Module):
     """
     Normalizing flow with multiple coupling layers.
     Provides invertible transformation for latent variables.
+
+    IMPROVED: Parameterized time_dim throughout for consistency.
     """
-    def __init__(self, latent_dim: int, hidden_dim: int, num_layers: int = 4):
+    def __init__(self, latent_dim: int, hidden_dim: int, num_layers: int = 4, time_dim: int = 32):
         super().__init__()
-        self.time_embed = TimeAwareTransform(time_dim=32)
+        self.time_embed = TimeAwareTransform(time_dim=time_dim)
 
         # Build coupling layers with alternating masks
         self.flows = nn.ModuleList()
         for i in range(num_layers):
             # Alternate which dimensions we transform
             mask = self._make_mask(latent_dim, i % 2)
+            # FIXED: Pass time_dim to CouplingLayer
             self.flows.append(
-                CouplingLayer(latent_dim, hidden_dim, mask)
+                CouplingLayer(latent_dim, hidden_dim, mask, time_dim=time_dim)
             )
 
     def _make_mask(self, dim: int, parity: int) -> Tensor:
@@ -1155,21 +1189,29 @@ class RaccoonMemory:
         self.buffer = []
         self.scores = []
 
-    def add(self, trajectory: Tensor, score: float):
+    def add(self, trajectory, score: float):
         """
         Add experience to memory with quality score.
         If full, remove worst experience.
         """
-        self.buffer.append(trajectory.detach().cpu())
+        # Handle both tensor and dict inputs
+        if isinstance(trajectory, dict):
+            # Already in dict format (from fixed continuous_update)
+            self.buffer.append(trajectory)
+        else:
+            # Old format - convert to CPU
+            self.buffer.append(trajectory.detach().cpu())
         self.scores.append(score)
 
-        # If memory full, forget the worst experience
+        # FIXED: Use numpy for efficiency instead of creating tensor each time
         if len(self.buffer) > self.max_size:
-            worst_idx = int(torch.tensor(self.scores).argmin().item())
+            import numpy as np
+            scores_array = np.array(self.scores)
+            worst_idx = int(scores_array.argmin())
             self.buffer.pop(worst_idx)
             self.scores.pop(worst_idx)
 
-    def sample(self, n: int, device: torch.device) -> list[Tensor]:
+    def sample(self, n: int, device: torch.device) -> list:
         """
         Sample experiences with bias toward higher quality.
 
@@ -1179,19 +1221,51 @@ class RaccoonMemory:
         Returns:
             List of sampled trajectories
         """
-        if len(self.buffer) < n:
-            return [t.to(device) for t in self.buffer]
+        if len(self.buffer) == 0:
+            raise RuntimeError("Cannot sample from empty memory buffer")
 
-        # Probability proportional to score (softmax for numerical stability)
-        scores_tensor = torch.tensor(self.scores, dtype=torch.float32)
-        scores_tensor = scores_tensor - scores_tensor.min() + 1e-6  # Shift to positive
-        probs = scores_tensor / scores_tensor.sum()
+        # FIXED: Determine if we need replacement
+        available = len(self.buffer)
+        replacement = available < n
 
-        indices = torch.multinomial(probs, n, replacement=False)
-        return [self.buffer[i].to(device) for i in indices]
+        # FIXED: Robust score normalization using softmax trick
+        import numpy as np
+        scores_array = np.array(self.scores)
+
+        # Subtract max for numerical stability (standard softmax trick)
+        scores_shifted = scores_array - scores_array.max()
+
+        # Use softmax with temperature
+        temperature = 1.0
+        exp_scores = np.exp(scores_shifted / temperature)
+        probs = exp_scores / exp_scores.sum()
+
+        # Ensure valid probabilities
+        probs = np.maximum(probs, 1e-10)
+        probs = probs / probs.sum()
+
+        probs_tensor = torch.from_numpy(probs).float()
+        indices = torch.multinomial(probs_tensor, n, replacement=replacement)
+
+        # Return sampled items (handle dict format from fixed continuous_update)
+        return [self.buffer[i] for i in indices]
 
     def __len__(self):
         return len(self.buffer)
+
+    def state_dict(self) -> dict:
+        """ADDED: Export memory state for checkpointing."""
+        return {
+            'buffer': self.buffer,  # Already on CPU from add()
+            'scores': self.scores,
+            'max_size': self.max_size,
+        }
+
+    def load_state_dict(self, state: dict):
+        """ADDED: Load memory from checkpoint."""
+        self.buffer = state['buffer']
+        self.scores = state['scores']
+        self.max_size = state['max_size']
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1307,8 +1381,8 @@ class RaccoonLogClassifier(nn.Module):
         self.enc_mean = nn.Linear(hidden_dim, latent_dim)
         self.enc_logvar = nn.Linear(hidden_dim, latent_dim)
 
-        # SDE dynamics
-        self.dynamics = RaccoonDynamics(latent_dim, hidden_dim, sigma=0.1)
+        # SDE dynamics (using new sigma_min/sigma_max parameters)
+        self.dynamics = RaccoonDynamics(latent_dim, hidden_dim, sigma_min=1e-4, sigma_max=1.0)
 
         # Normalizing flows
         self.flow = RaccoonFlow(latent_dim, hidden_dim, num_layers=4)
@@ -1383,6 +1457,15 @@ class RaccoonLogClassifier(nn.Module):
         """
         batch_size = tokens.shape[0]
 
+        # FIXED: Guard against empty batches
+        if batch_size == 0:
+            return torch.tensor(0.0, device=tokens.device), {
+                "class_loss": torch.tensor(0.0, device=tokens.device),
+                "kl_loss": torch.tensor(0.0, device=tokens.device),
+                "ep_loss": torch.tensor(0.0, device=tokens.device),
+                "accuracy": torch.tensor(0.0, device=tokens.device),
+            }
+
         # Encode
         mean, logvar = self.encode(tokens)
         z = self.sample_latent(mean, logvar)
@@ -1403,11 +1486,17 @@ class RaccoonLogClassifier(nn.Module):
         class_loss = F.cross_entropy(logits, labels)
 
         # KL divergence to prior
-        kl_loss = -0.5 * torch.mean(
-            1 + logvar - self.z0_logvar -
-            (mean - self.z0_mean).pow(2) / torch.exp(self.z0_logvar) -
-            torch.exp(logvar - self.z0_logvar)
+        # FIXED: Corrected KL formula (was inverted with wrong sign)
+        # KL(q||p) = 0.5 * mean[logvar_p - logvar + (var_q + (mu_p - mu_q)^2)/var_p - 1]
+        var_q = torch.exp(logvar)
+        var_p = torch.exp(self.z0_logvar)
+        kl_loss = 0.5 * torch.mean(
+            self.z0_logvar - logvar +
+            (var_q + (mean - self.z0_mean).pow(2)) / (var_p + 1e-8) -
+            1
         )
+        # Clamp to ensure non-negative
+        kl_loss = torch.clamp(kl_loss, min=0.0)
 
         # Epps-Pulley regularization
         z_for_test = z_flow.unsqueeze(0)  # (1, batch, latent)
@@ -1450,8 +1539,14 @@ class RaccoonLogClassifier(nn.Module):
             confidence = probs.max(dim=1).values
             score = confidence.mean().item()
 
-        # Add to memory
-        self.memory.add(torch.cat([tokens, labels.unsqueeze(1)], dim=1), score)
+        # FIXED: Store as dict instead of concatenating tensors
+        # Add to memory (store each sample separately with proper structure)
+        for i in range(tokens.shape[0]):
+            memory_item = {
+                'tokens': tokens[i:i+1].detach().cpu(),  # Keep batch dim
+                'label': labels[i:i+1].detach().cpu()
+            }
+            self.memory.add(memory_item, score)
 
         # Perform update if enough memory
         if len(self.memory) >= 32:
@@ -1459,24 +1554,31 @@ class RaccoonLogClassifier(nn.Module):
             memory_batch = self.memory.sample(16, device=tokens.device)
 
             if len(memory_batch) > 0:
-                # Separate tokens and labels
-                memory_tokens = torch.stack([m[:, :-1] for m in memory_batch])
-                memory_labels = torch.stack([m[:, -1] for m in memory_batch]).long()
+                # FIXED: Properly extract and concatenate from dict structure
+                device = tokens.device  # Get device from input tokens
+                memory_tokens_list = [m['tokens'].to(device) for m in memory_batch]
+                memory_labels_list = [m['label'].to(device) for m in memory_batch]
 
-                # Combine with new data
+                memory_tokens = torch.cat(memory_tokens_list, dim=0)  # (16, seq_len)
+                memory_labels = torch.cat(memory_labels_list, dim=0).squeeze()  # (16,)
+
+                # Combine with new data - shapes now match!
                 all_tokens = torch.cat([tokens, memory_tokens], dim=0)
                 all_labels = torch.cat([labels, memory_labels], dim=0)
 
-                # Small gradient update
-                loss, _ = self.forward(all_tokens, all_labels)
-                loss.backward()
+                # FIXED: Proper gradient management using optimizer
+                if not hasattr(self, '_adaptation_optimizer'):
+                    self._adaptation_optimizer = torch.optim.SGD(
+                        self.parameters(),
+                        lr=self.adaptation_rate,
+                        momentum=0.0
+                    )
 
-                # Apply small learning rate
-                with torch.no_grad():
-                    for param in self.parameters():
-                        if param.grad is not None:
-                            param.data -= self.adaptation_rate * param.grad
-                            param.grad.zero_()
+                # Forward pass and gradient update
+                loss, _ = self.forward(all_tokens, all_labels)
+                self._adaptation_optimizer.zero_grad()
+                loss.backward()
+                self._adaptation_optimizer.step()
 
 
 # ──────────────────────────────────────────────────────────────────────────────

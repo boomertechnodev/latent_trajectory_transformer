@@ -1016,7 +1016,7 @@ class FractalAttentionVisualizer:
         cantor = CantorSetAttention(config)
 
         for depth in range(max_depth):
-            indices = cantor.get_cantor_indices(seq_len, depth).numpy()
+            indices = cantor.get_cantor_indices(seq_len, depth).detach().numpy()
 
             # Create binary mask
             mask = np.zeros(seq_len)
@@ -1043,7 +1043,7 @@ class FractalAttentionVisualizer:
 
         fig, ax = plt.subplots(figsize=(12, 6))
 
-        weights = dragon.get_dragon_weights(seq_len).numpy()
+        weights = dragon.get_dragon_weights(seq_len).detach().numpy()
 
         ax.plot(weights, 'b-', linewidth=2, label='Dragon Curve Weights')
         ax.fill_between(range(seq_len), 0, weights, alpha=0.3)
@@ -1080,7 +1080,7 @@ class FractalAttentionVisualizer:
 
         # Cantor multi-scale
         cantor = CantorSetAttention(config)
-        cantor_idx = cantor.get_cantor_indices(seq_len).numpy()
+        cantor_idx = cantor.get_cantor_indices(seq_len).detach().numpy()
         cantor_attn = np.zeros(seq_len)
         cantor_attn[cantor_idx] = 1.0 / len(cantor_idx)
 
@@ -1090,7 +1090,7 @@ class FractalAttentionVisualizer:
 
         # Dragon hierarchical
         dragon = DragonCurveAttention(config)
-        dragon_weights = dragon.get_dragon_weights(seq_len).numpy()
+        dragon_weights = dragon.get_dragon_weights(seq_len).detach().numpy()
         dragon_weights = dragon_weights / dragon_weights.sum()
 
         axes[2].plot(dragon_weights, 'g-', linewidth=2)

@@ -1,0 +1,39 @@
+{
+  "model": "claude-opus-4-20250514",
+  "temperature": 0.7,
+  "max_tokens": 8192,
+  "system_prompt": "You are an advanced AI research assistant specializing in attention mechanisms, fractal mathematics, and neural network architectures. You have deep expertise in transformer models, computational complexity theory, and mathematical optimization.",
+  "features": {
+    "ultrathink": true,
+    "deep_analysis": true,
+    "mathematical_rigor": true,
+    "code_generation": true,
+    "visualization": true
+  },
+  "project_context": {
+    "name": "Fractal Attention Research",
+    "type": "neural_architecture_research",
+    "focus_areas": [
+      "O(n²) to O(log n) complexity reduction",
+      "Fractal pattern applications in attention",
+      "Hilbert curves and space-filling curves",
+      "Cantor sets for multi-scale sampling",
+      "Dragon curves for hierarchical dependencies",
+      "Julia sets for chaotic dynamics"
+    ],
+    "key_files": [
+      "fractal_attention.py",
+      "raccoon_attention.py",
+      "latent_drift_trajectory.py",
+      "BUG_REPORT.md",
+      "CLAUDE.md"
+    ]
+  },
+  "research_guidelines": {
+    "always_cite_sources": true,
+    "provide_mathematical_proofs": true,
+    "benchmark_performance": true,
+    "visualize_concepts": true,
+    "maintain_backwards_compatibility": true
+  }
+}

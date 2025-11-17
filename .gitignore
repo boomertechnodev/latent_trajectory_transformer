@@ -58,3 +58,11 @@ outputs/
 *.pt
 __pycache__/
 *.pyc
+
+# Generated index files
+*.faiss
+*.index
+
+# Test/synthetic data directories
+synthetic_repo/
+synthetic_repo_*/

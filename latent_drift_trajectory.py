@@ -1468,6 +1468,227 @@ class BenchmarkRunner:
         return summary
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+#  RaccoonLanguageModel: Adapter for TinyStories Language Modeling
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class RaccoonLanguageModel(nn.Module):
+    """
+    Adapter for RaccoonLogClassifier to perform language modeling on TinyStories.
+
+    Modifications from RaccoonLogClassifier:
+    1. Encoder handles longer sequences (256 tokens vs 50)
+    2. Language modeling head outputs vocab_size logits
+    3. Forward API matches Llama2Transformer: (tokens, targets) → (logits, loss)
+    4. Experience replay disabled for fair comparison with Llama2
+    5. Larger capacity: latent_dim=128, hidden_dim=256
+    6. Keeps SDE dynamics + normalizing flow for architectural comparison
+    """
+
+    def __init__(
+        self,
+        vocab_size: int,
+        latent_dim: int = 128,      # Increased from 32 for language modeling
+        hidden_dim: int = 256,       # Increased from 64
+        embed_dim: int = 64,         # Increased from 32
+        seq_len: int = 256,          # TinyStories sequence length
+        num_flow_layers: int = 4,    # Verified stable configuration
+    ):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.latent_dim = latent_dim
+        self.seq_len = seq_len
+
+        # Encoder: tokens → latent distribution (mean pooling over sequence)
+        self.encoder = nn.Sequential(
+            nn.Embedding(vocab_size, embed_dim),
+            nn.Linear(embed_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+        )
+        self.enc_mean = nn.Linear(hidden_dim, latent_dim)
+        self.enc_logvar = nn.Linear(hidden_dim, latent_dim)
+
+        # SDE dynamics (stochastic drift + diffusion)
+        self.dynamics = RaccoonDynamics(latent_dim, hidden_dim, sigma_min=1e-4, sigma_max=1.0)
+
+        # Normalizing flow (4 coupling layers)
+        self.flow = RaccoonFlow(latent_dim, hidden_dim, num_layers=num_flow_layers)
+
+        # Language modeling head: latent → vocab_size logits
+        # Deeper network for better expressiveness
+        self.lm_head = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, vocab_size)
+        )
+
+        # Latent regularization (Epps-Pulley normality test)
+        univariate_test = FastEppsPulley(t_max=5.0, n_points=17)
+        self.latent_test = SlicingUnivariateTest(
+            univariate_test=univariate_test,
+            num_slices=64,
+            reduction="mean",
+        )
+
+        # Learnable prior
+        self.z0_mean = nn.Parameter(torch.zeros(latent_dim))
+        self.z0_logvar = nn.Parameter(torch.zeros(latent_dim))
+
+        # Initialize weights
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        """Initialize weights following best practices."""
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def encode(self, tokens: Tensor) -> tuple[Tensor, Tensor]:
+        """
+        Encode tokens to latent distribution.
+
+        Args:
+            tokens: (batch, seq_len)
+        Returns:
+            mean: (batch, latent_dim)
+            logvar: (batch, latent_dim)
+        """
+        # Embed and pool over sequence dimension
+        x = self.encoder(tokens)  # (batch, seq_len, hidden)
+        x = x.mean(dim=1)  # (batch, hidden) - mean pooling
+
+        mean = self.enc_mean(x)   # (batch, latent_dim)
+        logvar = self.enc_logvar(x)  # (batch, latent_dim)
+
+        return mean, logvar
+
+    def sample_latent(self, mean: Tensor, logvar: Tensor) -> Tensor:
+        """Sample from latent distribution using reparameterization trick."""
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mean + eps * std
+
+    def forward(self, tokens: Tensor, targets: Tensor | None = None) -> tuple[Tensor, Tensor | None]:
+        """
+        Forward pass for language modeling.
+
+        Matches Llama2Transformer API for BenchmarkRunner compatibility.
+
+        Args:
+            tokens: (batch, seq_len) input token IDs
+            targets: (batch, seq_len) target token IDs (optional)
+
+        Returns:
+            logits: (batch, seq_len, vocab_size)
+            loss: scalar if targets provided, else None
+        """
+        batch_size, seq_len = tokens.shape
+
+        # Encode to latent distribution
+        mean, logvar = self.encode(tokens)  # (batch, latent_dim)
+        z = self.sample_latent(mean, logvar)  # (batch, latent_dim)
+
+        # Apply SDE dynamics (short trajectory for regularization)
+        t_span = torch.linspace(0.0, 0.1, 3, device=z.device)  # 3 steps
+        z_traj = solve_sde(self.dynamics, z, t_span)  # (batch, 3, latent_dim)
+        z = z_traj[:, -1, :]  # Take final state (batch, latent_dim)
+
+        # Apply normalizing flow
+        t = torch.ones(batch_size, 1, device=z.device) * 0.5  # Mid-time point
+        z_flow, log_det = self.flow(z, t, reverse=False)  # (batch, latent_dim)
+
+        # Language modeling head
+        logits_latent = self.lm_head(z_flow)  # (batch, vocab_size)
+
+        # Broadcast logits to sequence length
+        # Simple approach: use same logits for all positions
+        # More sophisticated: condition on position, but this is fair baseline
+        logits = logits_latent.unsqueeze(1).expand(batch_size, seq_len, self.vocab_size)
+
+        # Compute loss if targets provided
+        loss = None
+        if targets is not None:
+            # Language modeling cross-entropy
+            lm_loss = F.cross_entropy(
+                logits.view(-1, self.vocab_size),
+                targets.view(-1),
+                ignore_index=0  # Ignore PAD tokens
+            )
+
+            # KL divergence to prior
+            var_q = torch.exp(logvar)
+            var_p = torch.exp(self.z0_logvar)
+            kl_loss = 0.5 * torch.mean(
+                self.z0_logvar - logvar +
+                (var_q + (mean - self.z0_mean).pow(2)) / (var_p + 1e-8) -
+                1
+            )
+            kl_loss = torch.clamp(kl_loss, min=0.0)
+
+            # Epps-Pulley regularization on latent space
+            z_for_test = z_flow.unsqueeze(0)  # (1, batch, latent_dim)
+            ep_loss = self.latent_test(z_for_test)
+
+            # Total loss (same weighting as Raccoon classifier)
+            w_lm = 1.0
+            w_kl = 0.1
+            w_ep = 0.01
+            loss = w_lm * lm_loss + w_kl * kl_loss + w_ep * ep_loss
+
+            # Defensive: Check for NaN/Inf
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"⚠️  NaN/Inf in RaccoonLanguageModel loss!")
+                print(f"  lm_loss: {lm_loss.item():.4f}, kl_loss: {kl_loss.item():.4f}, ep_loss: {ep_loss.item():.4f}")
+                loss = torch.tensor(1e6, device=loss.device, requires_grad=True)
+
+        return logits, loss
+
+    def generate(self, tokens: Tensor, max_new_tokens: int, temperature: float = 1.0, top_k: int | None = None) -> Tensor:
+        """
+        Autoregressive generation (basic implementation).
+
+        Args:
+            tokens: (batch, T) initial token IDs
+            max_new_tokens: Number of tokens to generate
+            temperature: Sampling temperature
+            top_k: Top-k sampling (optional)
+
+        Returns:
+            (batch, T + max_new_tokens) generated sequence
+        """
+        for _ in range(max_new_tokens):
+            # Truncate to seq_len if needed
+            tokens_cond = tokens if tokens.size(1) <= self.seq_len else tokens[:, -self.seq_len:]
+
+            # Forward pass
+            logits, _ = self.forward(tokens_cond)
+
+            # Get logits for last position
+            logits = logits[:, -1, :] / temperature  # (batch, vocab_size)
+
+            # Optional top-k filtering
+            if top_k is not None:
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < v[:, [-1]]] = float('-inf')
+
+            # Sample from distribution
+            probs = F.softmax(logits, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)  # (batch, 1)
+
+            # Append to sequence
+            tokens = torch.cat([tokens, next_token], dim=1)
+
+        return tokens
+
+
 class Predictor(nn.Module):
     def __init__(self, latent_size: int, hidden_size: int):
         super().__init__()

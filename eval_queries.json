@@ -1,0 +1,156 @@
+{
+  "queries": [
+    {
+      "query": "SDE dynamics",
+      "relevant_files": ["latent_drift_trajectory.py"],
+      "relevant_functions": ["RaccoonDynamics", "solve_sde"],
+      "description": "Test synonym: should retrieve same results as 'stochastic differential equation'"
+    },
+    {
+      "query": "stochastic differential equation",
+      "relevant_files": ["latent_drift_trajectory.py"],
+      "relevant_functions": ["RaccoonDynamics", "solve_sde"],
+      "description": "Synonym test: should match 'SDE dynamics' via SYNONYM_DICTIONARY"
+    },
+    {
+      "query": "normalizing flow",
+      "relevant_files": ["latent_drift_trajectory.py"],
+      "relevant_functions": ["RaccoonFlow", "CouplingLayer"],
+      "description": "Test invertible transformation retrieval"
+    },
+    {
+      "query": "invertible transformation",
+      "relevant_files": ["latent_drift_trajectory.py"],
+      "relevant_functions": ["RaccoonFlow", "CouplingLayer"],
+      "description": "Synonym for normalizing flow"
+    },
+    {
+      "query": "EP test",
+      "relevant_files": ["latent_drift_trajectory.py"],
+      "relevant_functions": ["FastEppsPulley", "EppsPulleyCF"],
+      "description": "Abbreviation test"
+    },
+    {
+      "query": "Epps-Pulley normality test",
+      "relevant_files": ["latent_drift_trajectory.py"],
+      "relevant_functions": ["FastEppsPulley", "EppsPulleyCF"],
+      "description": "Full name: should match 'EP test'"
+    },
+    {
+      "query": "Raccoon continual learning",
+      "relevant_files": ["latent_drift_trajectory.py"],
+      "relevant_functions": ["RaccoonLogClassifier", "RaccoonMemory"],
+      "description": "Multi-word concept"
+    },
+    {
+      "query": "experience replay buffer",
+      "relevant_files": ["latent_drift_trajectory.py"],
+      "relevant_functions": ["RaccoonMemory"],
+      "description": "Synonym: memory buffer, replay buffer"
+    },
+    {
+      "query": "prevent catastrophic forgetting",
+      "relevant_files": ["latent_drift_trajectory.py"],
+      "relevant_functions": ["RaccoonMemory", "continuous_learning_phase"],
+      "description": "Purpose-level query: high-level understanding"
+    },
+    {
+      "query": "prevent NaN losses",
+      "relevant_files": ["latent_drift_trajectory.py"],
+      "relevant_functions": ["RaccoonDynamics.__init__", "PriorODE.__init__"],
+      "description": "Practical problem query"
+    },
+    {
+      "query": "drift and diffusion",
+      "relevant_files": ["latent_drift_trajectory.py"],
+      "relevant_functions": ["RaccoonDynamics"],
+      "description": "SDE components"
+    },
+    {
+      "query": "transformer encoder with attention",
+      "relevant_files": ["latent_drift_trajectory.py"],
+      "relevant_functions": ["PosteriorEncoder", "QKVAttention"],
+      "description": "Architecture query"
+    },
+    {
+      "query": "multi-head attention mechanism",
+      "relevant_files": ["latent_drift_trajectory.py"],
+      "relevant_functions": ["QKVAttention"],
+      "description": "Specific attention type"
+    },
+    {
+      "query": "positional encoding",
+      "relevant_files": ["latent_drift_trajectory.py"],
+      "relevant_functions": ["AddPositionalEncoding"],
+      "description": "Transformer component"
+    },
+    {
+      "query": "beam search decoding",
+      "relevant_files": ["improved_neural_code_search.py"],
+      "relevant_functions": ["ImprovedExplanationDecoder.beam_search_decode"],
+      "description": "Sequence generation method"
+    },
+    {
+      "query": "BPE tokenization",
+      "relevant_files": ["improved_neural_code_search.py"],
+      "relevant_functions": ["BPETokenizer"],
+      "description": "Tokenization method"
+    },
+    {
+      "query": "contrastive learning InfoNCE",
+      "relevant_files": ["neural_code_search_improved.py"],
+      "relevant_functions": ["compute_contrastive_loss"],
+      "description": "Contrastive loss function"
+    },
+    {
+      "query": "hard negative mining",
+      "relevant_files": ["neural_code_search_improved.py"],
+      "relevant_functions": ["mine_hard_negatives"],
+      "description": "Contrastive learning technique"
+    },
+    {
+      "query": "cross-encoder re-ranking",
+      "relevant_files": ["neural_code_search_improved.py"],
+      "relevant_functions": ["CrossEncoderReranker", "search_with_reranking"],
+      "description": "Search refinement"
+    },
+    {
+      "query": "FAISS approximate nearest neighbor",
+      "relevant_files": ["neural_code_search.py"],
+      "relevant_functions": ["build_faiss_index", "search_similar"],
+      "description": "Fast similarity search"
+    },
+    {
+      "query": "model quantization int8",
+      "relevant_files": ["neural_code_search.py"],
+      "relevant_functions": ["quantize_model"],
+      "description": "Model compression"
+    },
+    {
+      "query": "incremental index update",
+      "relevant_files": ["neural_code_search.py"],
+      "relevant_functions": ["update_index"],
+      "description": "Add files without full reindex"
+    },
+    {
+      "query": "log classification with concept drift",
+      "relevant_files": ["latent_drift_trajectory.py"],
+      "relevant_functions": ["LogDataset", "continuous_learning_phase"],
+      "description": "Continual learning task"
+    },
+    {
+      "query": "time-aware transform embedding",
+      "relevant_files": ["latent_drift_trajectory.py"],
+      "relevant_functions": ["TimeAwareTransform"],
+      "description": "Multi-scale time features"
+    }
+  ],
+  "metadata": {
+    "total_queries": 24,
+    "synonym_pairs": 8,
+    "purpose_queries": 2,
+    "architecture_queries": 5,
+    "technique_queries": 9,
+    "description": "Comprehensive evaluation set covering synonyms, technical concepts, architecture, and high-level purposes"
+  }
+}
